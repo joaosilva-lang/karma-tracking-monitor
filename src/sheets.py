@@ -2,15 +2,10 @@ from datetime import datetime
 import gspread
 from google.oauth2.credentials import Credentials
 
-SCOPES = [
-    "https://www.googleapis.com/auth/spreadsheets",
-    "https://www.googleapis.com/auth/analytics.readonly",
-]
-
 CONFIG_TAB = "config"
 RESULTS_TAB = "results"
 
-CONFIG_HEADERS = ["client_id", "platform", "event_name", "severity"]
+CONFIG_HEADERS = ["client_id", "account_id", "platform", "event_name", "severity"]
 RESULTS_HEADERS = ["checked_at", "client_id", "platform", "event_name", "severity", "count_7d", "status"]
 
 
@@ -19,7 +14,7 @@ def get_sheets_client(credentials: Credentials) -> gspread.Client:
 
 
 def read_config(sheet_id: str, client: gspread.Client) -> list[dict]:
-    """Returns list of {client_id, platform, event_name, severity} from the config tab."""
+    """Returns list of {client_id, account_id, platform, event_name, severity} from the config tab."""
     sh = client.open_by_key(sheet_id)
     try:
         ws = sh.worksheet(CONFIG_TAB)
@@ -28,7 +23,7 @@ def read_config(sheet_id: str, client: gspread.Client) -> list[dict]:
         ws.append_row(CONFIG_HEADERS)
         return []
 
-    records = ws.get_all_records()
+    records = ws.get_all_records(expected_headers=CONFIG_HEADERS)
     return [r for r in records if r.get("client_id") and r.get("event_name")]
 
 

@@ -10,7 +10,7 @@ def send_alert(webhook_url: str, failures: list[dict]) -> None:
     for f in failures:
         lines.append(
             f"• `{f['client_id']}` | {f['platform']} | `{f['event_name']}` — "
-            f"*{f['count_7d']} events* in last 7 days"
+            f"*{f['count_7d']} events* in last {f['goback_days']} days"
         )
 
     payload = {"text": "\n".join(lines)}

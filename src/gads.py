@@ -1,3 +1,4 @@
+from datetime import date, timedelta
 from google.ads.googleads.client import GoogleAdsClient
 from google.ads.googleads.errors import GoogleAdsException
 
@@ -19,23 +20,26 @@ def fetch_conversion_counts(customer_id: str, client: GoogleAdsClient, days: int
     """Returns {conversion_action_name: count} for the last `days` days."""
     ga_service = client.get_service("GoogleAdsService")
 
+    end_date = date.today() - timedelta(days=1)
+    start_date = end_date - timedelta(days=days - 1)
+
     query = f"""
         SELECT
-            segments.conversion_action_name,
+            conversion_action.name,
             metrics.all_conversions
-        FROM customer
-        WHERE segments.date DURING LAST_7_DAYS
+        FROM conversion_action
+        WHERE segments.date BETWEEN '{start_date.isoformat()}' AND '{end_date.isoformat()}'
+          AND conversion_action.status = 'ENABLED'
     """
 
     results: dict[str, float] = {}
 
     try:
-        response = ga_service.search_stream(customer_id=customer_id, query=query)
-        for batch in response:
-            for row in batch.results:
-                name = row.segments.conversion_action_name
-                count = row.metrics.all_conversions
-                results[name] = results.get(name, 0.0) + count
+        response = ga_service.search(customer_id=customer_id, query=query)
+        for row in response:
+            name = row.conversion_action.name
+            count = row.metrics.all_conversions
+            results[name] = results.get(name, 0.0) + count
     except GoogleAdsException as ex:
         raise RuntimeError(
             f"GAds API error for customer {customer_id}: {ex.error.code().name}"

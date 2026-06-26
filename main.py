@@ -13,6 +13,14 @@ SCOPES = [
     "https://www.googleapis.com/auth/adwords",
 ]
 
+# 24h-style check window per platform. GA4 data for "yesterday" is stable, so a
+# strict 1-day window is fine. Google Ads conversions lag (attribution can take
+# 24-72h), so we widen to 2 days (~48h) to avoid false positives.
+WINDOW_24H_DAYS = {"GA4": 1, "GADS": 2}
+WINDOW_24H_LABEL = {"GA4": "24h", "GADS": "48h"}
+
+TRUTHY = {"sim", "yes", "true", "1", "y", "s"}
+
 
 def build_credentials() -> Credentials:
     return Credentials(
@@ -32,9 +40,7 @@ def build_client_accounts(config_rows: list[dict]) -> dict:
         client_id = row["client_id"]
         platform = row["platform"].upper()
         account_id = str(row["account_id"])
-        if client_id not in accounts:
-            accounts[client_id] = {}
-        accounts[client_id][platform] = account_id
+        accounts.setdefault(client_id, {})[platform] = account_id
     return accounts
 
 
@@ -45,10 +51,20 @@ def get_event_config(config_rows: list[dict], client_id: str, platform: str, eve
                 and row["platform"].upper() == platform.upper()
                 and row["event_name"] == event_name):
             return {
-                "severity": row.get("severity", "secondary"),
+                "severity": row.get("severity", "secondary") or "secondary",
                 "goback_days": int(row["goback_days"]) if row.get("goback_days") else DEFAULT_GOBACK_DAYS,
             }
     return {"severity": "secondary", "goback_days": DEFAULT_GOBACK_DAYS}
+
+
+def get_24h_events(config_rows: list[dict], client_id: str, platform: str) -> set:
+    """Returns the set of event names flagged 24hours_lookback='sim' for a platform."""
+    flagged = set()
+    for row in config_rows:
+        if (row["client_id"] == client_id and row["platform"].upper() == platform.upper()
+                and str(row.get("24hours_lookback", "")).strip().lower() in TRUTHY):
+            flagged.add(row["event_name"])
+    return flagged
 
 
 def fetch_counts_by_days(account_id: str, platform: str, config_rows: list[dict],
@@ -73,20 +89,17 @@ def fetch_counts_by_days(account_id: str, platform: str, config_rows: list[dict]
     # One API call per unique goback_days value
     counts_by_days: dict[int, dict[str, int]] = {}
     for days in days_to_events:
-        if days not in counts_by_days:
-            if platform_upper == "GA4":
-                counts_by_days[days] = fetch_event_counts(account_id, credentials, days=days)
-            elif platform_upper == "GADS":
-                counts_by_days[days] = fetch_conversion_counts(account_id, gads_client, days=days)
+        if platform_upper == "GA4":
+            counts_by_days[days] = fetch_event_counts(account_id, credentials, days=days)
+        elif platform_upper == "GADS":
+            counts_by_days[days] = fetch_conversion_counts(account_id, gads_client, days=days)
 
-    # Build event_config map for quick lookup
     event_days_map = {
         row["event_name"]: int(row["goback_days"]) if row.get("goback_days") else DEFAULT_GOBACK_DAYS
         for row in config_rows
         if row["client_id"] == client_id and row["platform"].upper() == platform_upper
     }
 
-    # Combine: all events from all calls, each mapped to its appropriate days result
     all_events: set[str] = set()
     for counts in counts_by_days.values():
         all_events.update(counts.keys())
@@ -100,25 +113,65 @@ def fetch_counts_by_days(account_id: str, platform: str, config_rows: list[dict]
     return result
 
 
+def _fetch_24h_counts(account_id: str, platform: str, credentials: Credentials,
+                      gads_client=None) -> dict[str, int]:
+    days = WINDOW_24H_DAYS[platform]
+    if platform == "GA4":
+        return fetch_event_counts(account_id, credentials, days=days)
+    return fetch_conversion_counts(account_id, gads_client, days=days)
+
+
+def _check_platform(client_id: str, platform: str, display_name: str, account_id: str,
+                    credentials: Credentials, config_rows: list[dict],
+                    gads_client=None) -> list[dict]:
+    """Runs goback + (optional) 24h checks for one platform, returning result rows."""
+    results = []
+
+    # --- Wide goback-window check (one row per event) ---
+    event_results = fetch_counts_by_days(
+        account_id, platform, config_rows, client_id, credentials, gads_client=gads_client
+    )
+    for event_name, (count, days) in event_results.items():
+        cfg = get_event_config(config_rows, client_id, platform, event_name)
+        results.append({
+            "client_id": client_id,
+            "platform": display_name,
+            "event_name": event_name,
+            "severity": cfg["severity"],
+            "window": f"{days}d",
+            "count": count,
+            "status": "OK" if count > 0 else "FAIL",
+        })
+
+    # --- Short 24h-style check (only for flagged events) ---
+    flagged = get_24h_events(config_rows, client_id, platform)
+    if flagged:
+        counts_24h = _fetch_24h_counts(account_id, platform, credentials, gads_client=gads_client)
+        label = WINDOW_24H_LABEL[platform]
+        for event_name in flagged:
+            count = counts_24h.get(event_name, 0)
+            cfg = get_event_config(config_rows, client_id, platform, event_name)
+            results.append({
+                "client_id": client_id,
+                "platform": display_name,
+                "event_name": event_name,
+                "severity": cfg["severity"],
+                "window": label,
+                "count": count,
+                "status": "OK" if count > 0 else "FAIL",
+            })
+
+    return results
+
+
 def run_checks(client_id: str, platforms: dict[str, str], credentials: Credentials,
                config_rows: list[dict]) -> list[dict]:
     results = []
 
     if "GA4" in platforms:
-        event_results = fetch_counts_by_days(
-            platforms["GA4"], "GA4", config_rows, client_id, credentials
-        )
-        for event_name, (count, days) in event_results.items():
-            cfg = get_event_config(config_rows, client_id, "GA4", event_name)
-            results.append({
-                "client_id": client_id,
-                "platform": "GA4",
-                "event_name": event_name,
-                "severity": cfg["severity"],
-                "goback_days": days,
-                "count_7d": count,
-                "status": "OK" if count > 0 else "FAIL",
-            })
+        results.extend(_check_platform(
+            client_id, "GA4", "GA4", platforms["GA4"], credentials, config_rows
+        ))
 
     if "GADS" in platforms:
         gads_client = get_gads_client(
@@ -128,21 +181,10 @@ def run_checks(client_id: str, platforms: dict[str, str], credentials: Credentia
             developer_token=os.environ["GOOGLE_ADS_DEVELOPER_TOKEN"],
             login_customer_id=os.environ["GOOGLE_ADS_LOGIN_CUSTOMER_ID"],
         )
-        event_results = fetch_counts_by_days(
-            platforms["GADS"], "GADS", config_rows, client_id, credentials,
+        results.extend(_check_platform(
+            client_id, "GADS", "GAds", platforms["GADS"], credentials, config_rows,
             gads_client=gads_client
-        )
-        for conv_name, (count, days) in event_results.items():
-            cfg = get_event_config(config_rows, client_id, "GAds", conv_name)
-            results.append({
-                "client_id": client_id,
-                "platform": "GAds",
-                "event_name": conv_name,
-                "severity": cfg["severity"],
-                "goback_days": days,
-                "count_7d": count,
-                "status": "OK" if count > 0 else "FAIL",
-            })
+        ))
 
     return results
 
@@ -159,8 +201,7 @@ def main() -> None:
     all_results = []
     for client_id, platforms in client_accounts.items():
         print(f"Checking {client_id}...")
-        results = run_checks(client_id, platforms, credentials, config_rows)
-        all_results.extend(results)
+        all_results.extend(run_checks(client_id, platforms, credentials, config_rows))
 
     write_results(sheet_id, sheets_client, all_results)
 

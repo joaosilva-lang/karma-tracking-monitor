@@ -4,7 +4,7 @@ from google.oauth2.credentials import Credentials
 
 from src.ga4 import fetch_event_counts
 from src.gads import fetch_conversion_counts, get_gads_client
-from src.sheets import get_sheets_client, read_config, write_results
+from src.sheets import get_sheets_client, read_config, write_results, DEFAULT_GOBACK_DAYS
 from src.slack import send_alert
 
 SCOPES = [
@@ -38,13 +38,66 @@ def build_client_accounts(config_rows: list[dict]) -> dict:
     return accounts
 
 
-def get_severity(config_rows: list[dict], client_id: str, platform: str, event_name: str) -> str:
+def get_event_config(config_rows: list[dict], client_id: str, platform: str, event_name: str) -> dict:
+    """Returns {severity, goback_days} for a given event, with defaults if not configured."""
     for row in config_rows:
         if (row["client_id"] == client_id
                 and row["platform"].upper() == platform.upper()
                 and row["event_name"] == event_name):
-            return row["severity"]
-    return "secondary"
+            return {
+                "severity": row.get("severity", "secondary"),
+                "goback_days": int(row["goback_days"]) if row.get("goback_days") else DEFAULT_GOBACK_DAYS,
+            }
+    return {"severity": "secondary", "goback_days": DEFAULT_GOBACK_DAYS}
+
+
+def fetch_counts_by_days(account_id: str, platform: str, config_rows: list[dict],
+                         client_id: str, credentials: Credentials,
+                         gads_client=None) -> dict[str, tuple[int, int]]:
+    """
+    Returns {event_name: (count, goback_days)} using per-event time windows.
+    Groups events by goback_days to minimize API calls.
+    """
+    platform_upper = platform.upper()
+
+    # Build map: goback_days -> set of configured event names for this platform
+    days_to_events: dict[int, set] = {}
+    for row in config_rows:
+        if row["client_id"] == client_id and row["platform"].upper() == platform_upper:
+            days = int(row["goback_days"]) if row.get("goback_days") else DEFAULT_GOBACK_DAYS
+            days_to_events.setdefault(days, set()).add(row["event_name"])
+
+    # Always include a default call to catch dynamically discovered events
+    days_to_events.setdefault(DEFAULT_GOBACK_DAYS, set())
+
+    # One API call per unique goback_days value
+    counts_by_days: dict[int, dict[str, int]] = {}
+    for days in days_to_events:
+        if days not in counts_by_days:
+            if platform_upper == "GA4":
+                counts_by_days[days] = fetch_event_counts(account_id, credentials, days=days)
+            elif platform_upper == "GADS":
+                counts_by_days[days] = fetch_conversion_counts(account_id, gads_client, days=days)
+
+    # Build event_config map for quick lookup
+    event_days_map = {
+        row["event_name"]: int(row["goback_days"]) if row.get("goback_days") else DEFAULT_GOBACK_DAYS
+        for row in config_rows
+        if row["client_id"] == client_id and row["platform"].upper() == platform_upper
+    }
+
+    # Combine: all events from all calls, each mapped to its appropriate days result
+    all_events: set[str] = set()
+    for counts in counts_by_days.values():
+        all_events.update(counts.keys())
+
+    result = {}
+    for event_name in all_events:
+        days = event_days_map.get(event_name, DEFAULT_GOBACK_DAYS)
+        count = counts_by_days.get(days, {}).get(event_name, 0)
+        result[event_name] = (count, days)
+
+    return result
 
 
 def run_checks(client_id: str, platforms: dict[str, str], credentials: Credentials,
@@ -52,13 +105,17 @@ def run_checks(client_id: str, platforms: dict[str, str], credentials: Credentia
     results = []
 
     if "GA4" in platforms:
-        ga4_counts = fetch_event_counts(platforms["GA4"], credentials)
-        for event_name, count in ga4_counts.items():
+        event_results = fetch_counts_by_days(
+            platforms["GA4"], "GA4", config_rows, client_id, credentials
+        )
+        for event_name, (count, days) in event_results.items():
+            cfg = get_event_config(config_rows, client_id, "GA4", event_name)
             results.append({
                 "client_id": client_id,
                 "platform": "GA4",
                 "event_name": event_name,
-                "severity": get_severity(config_rows, client_id, "GA4", event_name),
+                "severity": cfg["severity"],
+                "goback_days": days,
                 "count_7d": count,
                 "status": "OK" if count > 0 else "FAIL",
             })
@@ -71,13 +128,18 @@ def run_checks(client_id: str, platforms: dict[str, str], credentials: Credentia
             developer_token=os.environ["GOOGLE_ADS_DEVELOPER_TOKEN"],
             login_customer_id=os.environ["GOOGLE_ADS_LOGIN_CUSTOMER_ID"],
         )
-        gads_counts = fetch_conversion_counts(platforms["GADS"], gads_client)
-        for conv_name, count in gads_counts.items():
+        event_results = fetch_counts_by_days(
+            platforms["GADS"], "GADS", config_rows, client_id, credentials,
+            gads_client=gads_client
+        )
+        for conv_name, (count, days) in event_results.items():
+            cfg = get_event_config(config_rows, client_id, "GAds", conv_name)
             results.append({
                 "client_id": client_id,
                 "platform": "GAds",
                 "event_name": conv_name,
-                "severity": get_severity(config_rows, client_id, "GAds", conv_name),
+                "severity": cfg["severity"],
+                "goback_days": days,
                 "count_7d": count,
                 "status": "OK" if count > 0 else "FAIL",
             })

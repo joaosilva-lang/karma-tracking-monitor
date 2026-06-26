@@ -5,8 +5,9 @@ from google.oauth2.credentials import Credentials
 CONFIG_TAB = "config"
 RESULTS_TAB = "results"
 
-CONFIG_HEADERS = ["client_id", "account_id", "platform", "event_name", "severity"]
-RESULTS_HEADERS = ["checked_at", "client_id", "platform", "event_name", "severity", "count_7d", "status"]
+CONFIG_HEADERS = ["client_id", "account_id", "platform", "event_name", "severity", "goback_days"]
+DEFAULT_GOBACK_DAYS = 7
+RESULTS_HEADERS = ["checked_at", "client_id", "platform", "event_name", "severity", "goback_days", "count", "status"]
 
 
 def get_sheets_client(credentials: Credentials) -> gspread.Client:
@@ -44,6 +45,7 @@ def write_results(sheet_id: str, client: gspread.Client, rows: list[dict]) -> No
             row["platform"],
             row["event_name"],
             row["severity"],
+            row["goback_days"],
             row["count_7d"],
             row["status"],
         ])

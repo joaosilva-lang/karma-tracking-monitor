@@ -1,0 +1,76 @@
+"""Pure helpers for window counts and the weekday-median baseline.
+
+Everything here operates on {iso_date: count} maps and stdlib types only (no
+API clients), so it can be unit-tested with synthetic data.
+"""
+from datetime import date, timedelta
+from statistics import median
+
+BASELINE_DAYS = 90
+# Relative (WARN) checks only apply to events whose weekday median is at least
+# this — below it, day-to-day Poisson noise makes % comparisons meaningless.
+BASELINE_MIN_MEDIAN = 10
+BASELINE_THRESHOLD_DEFAULT = 0.5
+
+
+def normalize_date(value: str) -> str:
+    """GA4 returns dates as YYYYMMDD, GAds as YYYY-MM-DD. Normalize to ISO."""
+    v = str(value).strip()
+    if len(v) == 8 and v.isdigit():
+        return f"{v[0:4]}-{v[4:6]}-{v[6:8]}"
+    return v
+
+
+def date_range(end: date, days: int) -> list[str]:
+    """ISO dates for the `days`-day window ending at `end` (inclusive), oldest first."""
+    return [(end - timedelta(days=i)).isoformat() for i in range(days - 1, -1, -1)]
+
+
+def window_count(day_map: dict[str, float], end: date, days: int) -> float:
+    """Total count in the `days`-day window ending at `end` (inclusive)."""
+    return sum(day_map.get(d, 0) for d in date_range(end, days))
+
+
+def weekday_median(day_map: dict[str, float], test_day: date,
+                   lookback_days: int = BASELINE_DAYS) -> float:
+    """Median count on test_day's weekday over the lookback window strictly
+    before test_day (~12 samples for 90 days). Days with no data count as 0."""
+    samples = []
+    d = test_day - timedelta(days=7)
+    start = test_day - timedelta(days=lookback_days)
+    while d >= start:
+        samples.append(day_map.get(d.isoformat(), 0))
+        d -= timedelta(days=7)
+    return float(median(samples)) if samples else 0.0
+
+
+def per_weekday_medians(day_map: dict[str, float], dates: list[str]) -> list[float]:
+    """Median per weekday (index 0=Mon .. 6=Sun) over the given ISO dates."""
+    buckets: dict[int, list[float]] = {i: [] for i in range(7)}
+    for d in dates:
+        buckets[date.fromisoformat(d).weekday()].append(day_map.get(d, 0))
+    return [float(median(buckets[i])) if buckets[i] else 0.0 for i in range(7)]
+
+
+def parse_threshold(raw, default: float = BASELINE_THRESHOLD_DEFAULT) -> float:
+    """Accepts '50', '50%' or '0.5' (all meaning 50%). Empty/invalid -> default."""
+    if raw is None:
+        return default
+    s = str(raw).strip().rstrip("%").replace(",", ".")
+    if not s:
+        return default
+    try:
+        value = float(s)
+    except ValueError:
+        return default
+    return value / 100 if value > 1 else value
+
+
+def short_check_status(count: float, expected: float, threshold: float) -> str:
+    """FAIL on zero; WARN when a baseline-eligible event (expected >=
+    BASELINE_MIN_MEDIAN) falls below threshold*expected; OK otherwise."""
+    if count == 0:
+        return "FAIL"
+    if expected >= BASELINE_MIN_MEDIAN and count < threshold * expected:
+        return "WARN"
+    return "OK"

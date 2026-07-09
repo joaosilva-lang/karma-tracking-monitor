@@ -49,6 +49,8 @@ ativamente** quando algo pára.
                     │  │ results       │  │◄──── escrito pelo check diário
                     │  ├───────────────┤  │
                     │  │ history_analysis│ │◄──── escrito pela análise on-demand
+                    │  ├───────────────┤  │
+                    │  │ daily_history │  │◄──── idem (matriz p/ gráficos, in-place)
                     │  └───────────────┘  │
                     └──────────┬──────────┘
                                │ lê config
@@ -92,8 +94,12 @@ Há **dois programas independentes**:
 | `platform` | `GA4` ou `GAds` | A que plataforma pertence esta linha |
 | `event_name` | `Footer_ContactUs` | Nome do evento (GA4) ou da conversão (GAds) |
 | `severity` | `critical` ou `secondary` | `critical` → alerta Slack; `secondary` → só Sheet |
-| `goback_days` | `10` | Janela larga de verificação, em dias (default 7 se vazio) |
-| `24hours_lookback` | `sim` / `não` | Ativa o check rápido de 24h para este evento |
+| `goback_days` | `10` | Janela larga de verificação, em dias (default 7 se vazio; máx. 90) |
+| `24hBackGA4_48hBackGAds` | `sim` / `não` | Força o check curto de zero para eventos de baixo volume (ver secção 5) |
+| `baseline_threshold_pct` | `40` | *(Opcional)* Limiar do WARN em % da mediana do dia-da-semana (vazio = 50). Aceita `40`, `40%` ou `0.4` |
+
+> A coluna `baseline_threshold_pct` é opcional na Sheet — o código tolera a sua ausência
+> (só exige as colunas que existirem na primeira linha).
 
 **Notas importantes:**
 - Uma linha por (cliente, plataforma, evento). O mesmo `client_id` aparece em várias linhas.
@@ -115,14 +121,18 @@ Recriada a cada corrida (histórico limpo, sem acumular). Uma linha por (evento,
 | `severity` | `critical` | Copiado da config |
 | `window` | `10d`, `24h`, `48h` | **Que janela** produziu esta linha (ver secção 5) |
 | `count` | `5` | Eventos/conversões nessa janela |
-| `status` | `OK` / `FAIL` | `FAIL` se `count == 0` |
+| `expected` | `45.0` | Mediana do dia-da-semana usada como baseline (vazio nas linhas sem check relativo) |
+| `status` | `OK` / `WARN` / `FAIL` | `FAIL` se `count == 0`; `WARN` se `count` < limiar × `expected` |
 
-> Um evento com `24hours_lookback=sim` produz **duas** linhas: uma da janela larga
-> (`10d`) e outra da janela curta (`24h`/`48h`).
+> Um evento verificado na janela curta (por baseline automática ou por flag) produz
+> **duas** linhas: uma da janela larga (`10d`) e outra da janela curta (`24h`/`48h`).
+> Um evento configurado que **desapareça por completo** dos dados continua a gerar a
+> linha da janela larga com `count 0` → `FAIL` (o universo reportado é a união dos
+> eventos descobertos na API com os eventos listados na `config`).
 
 ### Aba `history_analysis` — escrita pelo `analyze_history.py`
 
-Recriada a cada corrida. Ajuda-te a preencher a coluna `24hours_lookback`:
+Recriada a cada corrida. Ajuda-te a preencher a coluna `24hBackGA4_48hBackGAds`:
 
 | Coluna | Significado |
 |---|---|
@@ -131,10 +141,20 @@ Recriada a cada corrida. Ajuda-te a preencher a coluna `24hours_lookback`:
 | `days_fired_of_90` | Em quantos dos últimos 90 dias o evento disparou ≥1 vez |
 | `pct_days` | `days_fired_of_90 / 90` em percentagem |
 | `avg_per_day` | Volume médio diário nos 90 dias |
+| `median_per_day` | Mediana diária nos 90 dias (robusta a picos de campanha) |
+| `weekday_medians` | Mediana por dia-da-semana (`Seg 12 · Ter 14 · …`) — para calibrar o `baseline_threshold_pct` |
 | `suggestion_24h` | `sim` se disparou em ≥80% dos dias, senão `não` |
 
 **Workflow de uso:** corres `analyze_history.py` → vês as sugestões → copias `sim`/`não`
-para a coluna `24hours_lookback` da aba `config` nos eventos que decidires.
+para a coluna `24hBackGA4_48hBackGAds` da aba `config` nos eventos de baixo volume que decidires
+vigiar; usas as medianas para ajustar thresholds.
+
+### Aba `daily_history` — escrita pelo `analyze_history.py`
+
+Matriz de visualização: uma linha por data (últimos 90 dias) e uma coluna por
+(`cliente|plataforma|evento`). É atualizada **in-place** (clear + update, nunca
+apagada e recriada) precisamente para os **gráficos nativos do Google Sheets** que
+criares sobre ela sobreviverem a cada refresh.
 
 ---
 
@@ -148,23 +168,43 @@ Cada evento pode ser verificado em **duas janelas com propósitos distintos**:
   disparam pelo menos uma vez, por isso `count == 0` é um sinal forte de que algo partiu.
 - Configurável por evento (coluna `goback_days`).
 
-### Janela curta (24h) — opcional, por evento (`24hours_lookback=sim`)
-- "Este evento disparou *ontem*?" — deteção rápida de falhas (a diferença entre dar conta
-  hoje vs. daqui a 10 dias).
-- **Só faz sentido para eventos de disparo diário.** Um evento de baixo volume (2-3 por
-  semana) dá `count == 0` em muitos dias *legitimamente* — verificá-lo a 24h geraria falsos
-  positivos. Por isso o flag é seletivo e a sugestão exige ≥80% de dias com disparo.
-- **Lógica de falha:** `count == 0` (zero absoluto). Não usamos baseline relativa (ainda).
+### Janela curta (24h/48h) — automática acima do volume mínimo, opt-in abaixo
+- "Este evento disparou no último dia *estável*, e em volume normal?" — deteção rápida
+  de falhas (a diferença entre dar conta hoje vs. daqui a 10 dias).
+- **Baseline relativa (automática).** Para cada evento calcula-se a **mediana do
+  dia-da-semana** testado sobre os 90 dias anteriores (~12 amostras do mesmo dia da
+  semana — uma terça compara-se com as últimas ~12 terças). Se essa mediana for
+  ≥ `BASELINE_MIN_MEDIAN` (10/dia), o evento entra no check curto **sem configuração
+  nenhuma**, com três estados:
+  - `FAIL` — `count == 0` (morreu);
+  - `WARN` — `count` < 50% da mediana (default; override por `baseline_threshold_pct`);
+  - `OK` — caso contrário.
+- **Porquê mediana por dia-da-semana?** Resolve dois falsos positivos de uma vez: a
+  sazonalidade semanal (sábado tem naturalmente menos volume que terça — comparar com a
+  média geral dispararia todos os fins de semana) e os outliers (um pico de campanha
+  inflaciona uma média, mas quase não move uma mediana).
+- **Flag `24hBackGA4_48hBackGAds=sim`** — continua a existir para eventos **abaixo** do volume
+  mínimo que queiras mesmo assim vigiar diariamente: recebem só o check de zero
+  (`OK`/`FAIL`), sem WARN, porque em baixo volume a comparação percentual é ruído.
+  A sugestão do `analyze_history.py` (≥80% de dias com disparo) mantém-se para este flag.
 
-#### Por que GA4 usa 24h mas GAds usa 48h
+#### Por que GA4 testa "ontem" mas GAds testa "anteontem"
 GA4 processa os eventos rápido — os dados de "ontem" já estão estáveis. O **Google Ads tem
 *conversion lag***: uma conversão de ontem pode só ser totalmente reportada 24-72h depois
-(janelas de atribuição). Um check estrito de 24h em GAds daria `count == 0` por os dados
-ainda não terem assentado, não por avaria. Para dar margem, o check curto em GAds usa uma
-janela de **48h** (`WINDOW_24H_DAYS = {"GA4": 1, "GADS": 2}` em [main.py](main.py)).
+(janelas de atribuição). Testar "ontem" em GAds daria `count` baixo por os dados ainda não
+terem assentado, não por avaria. Por isso o check curto em GAds testa o **dia mais recente
+estável — anteontem** (`STABLE_DAY_OFFSET = {"GA4": 1, "GADS": 2}` em [main.py](main.py)),
+comparado com a mediana do dia-da-semana respetivo.
 
-> O flag na Sheet chama-se sempre `24hours_lookback`; é o código que ajusta a janela real
-> conforme a plataforma. A coluna `window` da aba `results` mostra a janela real (`24h`/`48h`).
+> A coluna `window` da aba `results` mostra `24h` (GA4) ou `48h` (GAds) para o check curto.
+
+### Uma só chamada à API por (cliente, plataforma)
+O check diário faz **um único fetch de 90 dias com breakdown diário** por conta
+(`fetch_daily_event_counts` / `fetch_daily_conversion_counts`) e calcula localmente a
+janela larga (soma dos últimos `goback_days` dias), o check curto e a baseline a partir
+da mesma matriz `{evento: {data: contagem}}`. Menos chamadas do que uma por
+`goback_days` distinto, e uma única fonte de dados para tudo. Consequência: `goback_days`
+está limitado a 90.
 
 ---
 
@@ -172,13 +212,15 @@ janela de **48h** (`WINDOW_24H_DAYS = {"GA4": 1, "GADS": 2}` em [main.py](main.p
 
 | Situação | Sheet `results` | Slack |
 |---|---|---|
-| `OK` (count > 0) | ✅ regista | — |
-| `FAIL` + `secondary` | ✅ regista | — |
+| `OK` | ✅ regista | — |
+| `FAIL` ou `WARN` + `secondary` | ✅ regista | — |
 | `FAIL` + `critical` (qualquer janela) | ✅ regista | 🔔 alerta |
+| `WARN` + `critical` | ✅ regista | 🔔 alerta |
 
-No Slack, a mensagem **etiqueta a janela** para a equipa perceber a urgência:
-- 🔴 janela curta (`24h`/`48h`) = "partiu ontem" — urgente
-- 🟠 janela larga (`10d`) = "não dispara há X dias"
+No Slack, a mensagem **etiqueta a janela e o tipo** para a equipa perceber a urgência:
+- 🔴 `FAIL` na janela curta (`24h`/`48h`) = "partiu ontem" — urgente
+- 🟠 `FAIL` na janela larga (`10d`) = "não dispara há X dias"
+- 🟡 `WARN` = "ainda dispara, mas muito abaixo do normal" (mostra count vs. mediana e % abaixo)
 
 Ver [src/slack.py](src/slack.py).
 
@@ -188,12 +230,13 @@ Ver [src/slack.py](src/slack.py).
 
 | Ficheiro | Papel |
 |---|---|
-| [main.py](main.py) | Orquestrador do check diário. Lê config, corre checks, escreve results, alerta. |
-| [src/ga4.py](src/ga4.py) | Acesso à GA4 Data API. `fetch_event_counts` (janela) + `fetch_daily_event_counts` (breakdown diário p/ análise). |
-| [src/gads.py](src/gads.py) | Acesso à Google Ads API. `fetch_conversion_counts` + `fetch_daily_conversion_counts`. |
-| [src/sheets.py](src/sheets.py) | Leitura da config e escrita das abas `results` / `history_analysis`. Define os schemas (headers). |
-| [src/slack.py](src/slack.py) | Formata e envia o alerta Slack via Incoming Webhook. |
-| [analyze_history.py](analyze_history.py) | Análise de 90 dias on-demand → sugestões de 24h. |
+| [main.py](main.py) | Orquestrador do check diário. Lê config, corre checks (janelas + baseline), escreve results, alerta. |
+| [src/baseline.py](src/baseline.py) | Helpers puros (sem APIs): janelas, mediana por dia-da-semana, decisão OK/WARN/FAIL, parsing do threshold. Testável com dados sintéticos. |
+| [src/ga4.py](src/ga4.py) | Acesso à GA4 Data API. `fetch_daily_event_counts` (breakdown diário, base de tudo) + `fetch_event_counts` (janela agregada, legado). |
+| [src/gads.py](src/gads.py) | Acesso à Google Ads API. `fetch_daily_conversion_counts` + `fetch_conversion_counts` (legado). |
+| [src/sheets.py](src/sheets.py) | Leitura da config e escrita das abas `results` / `history_analysis` / `daily_history`. Define os schemas (headers). |
+| [src/slack.py](src/slack.py) | Formata e envia o alerta Slack via Incoming Webhook (🔴/🟠 FAIL, 🟡 WARN). |
+| [analyze_history.py](analyze_history.py) | Análise de 90 dias on-demand → sugestões de 24h, medianas p/ calibração e aba `daily_history`. |
 | [setup_oauth.py](setup_oauth.py) | Fluxo OAuth local, uma vez. Gera os 3 valores p/ GitHub Secrets. |
 | [.github/workflows/daily_check.yml](.github/workflows/daily_check.yml) | Cron diário (08:00 UTC) + trigger manual. |
 | [.github/workflows/analyze_history.yml](.github/workflows/analyze_history.yml) | Trigger manual da análise de 90 dias. |
@@ -225,7 +268,7 @@ Não há código a mudar. Só a Sheet:
 2. Garante que a tua conta Google (via MCC) tem acesso à conta GAds e à property GA4 do
    cliente. (Para GAds, têm de estar sob a MCC da Karma.)
 3. (Opcional) Corre o workflow **90-Day History Analysis** → vê a aba `history_analysis`
-   → preenche `24hours_lookback=sim` nos eventos de disparo diário que queres vigiar a 24h.
+   → preenche `24hBackGA4_48hBackGAds=sim` nos eventos de disparo diário que queres vigiar a 24h.
 4. Pronto. O próximo check diário já inclui o cliente novo.
 
 > **Eventos importantes diferem por cliente.** O Westlake é lead-gen puro (conversões de
@@ -238,13 +281,18 @@ Não há código a mudar. Só a Sheet:
 ## 10. Decisões e estado (histórico para contexto)
 
 - ✅ Config 100% Sheet-driven (migrámos de ficheiros JSON por cliente).
-- ✅ `goback_days` configurável por evento.
-- ✅ Check de 24h opcional por evento, com janela ajustada à plataforma (GA4 24h / GAds 48h).
+- ✅ `goback_days` configurável por evento (máx. 90).
+- ✅ Check curto com janela ajustada à plataforma (GA4 testa ontem / GAds testa anteontem).
 - ✅ Análise de 90 dias para sugerir candidatos a 24h (limiar 80%).
+- ✅ **Baseline relativa** (jul 2026): mediana por dia-da-semana, WARN abaixo de 50%
+  (configurável), automática para eventos com mediana ≥10/dia. Aba `daily_history` para
+  visualização. Corrigido também o ponto cego em que um evento configurado totalmente
+  morto desaparecia dos results sem FAIL.
 - ⏸️ **Meta Ads** — discutido, adiável. O modelo Sheet-driven já comporta uma `platform`
   nova; faltaria um `src/meta.py` análogo e o ramo respetivo em `main.py`.
 - ⏸️ **Verificação de valor/revenue** (não só contagem) — para clientes de e-commerce.
-- ⏸️ **Baseline relativa** no check de 24h (alertar a <X% do esperado, não só a zero).
+- ⏸️ **Renomeação de eventos** — considerada (jun 2026) e adiada: os nomes atuais são
+  autoexplicativos. Se um dia avançar, atenção à descontinuidade de série no GA4.
 
 ---
 
@@ -252,6 +300,9 @@ Não há código a mudar. Só a Sheet:
 
 - O check diário **recria** a aba `results` a cada corrida — não acumula histórico linha a
   linha. Se quiseres histórico de longo prazo, é preciso mudar para append (decisão futura).
+- A aba `daily_history` é a exceção: é atualizada **in-place** para os gráficos nativos
+  do Sheets criados sobre ela não morrerem. (Se o conjunto de eventos mudar, as colunas
+  deslocam-se — pode ser preciso reapontar os ranges dos gráficos.)
 - Versões de dependências em [requirements.txt](requirements.txt). Nota: `google-ads` tem
   de ser uma versão com a API atual (usamos `31.1.0`); versões antigas usavam a API v17 já
   desativada e davam erro `GRPC target method can't be resolved`.

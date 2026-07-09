@@ -8,6 +8,8 @@ from google.analytics.data_v1beta.types import (
 )
 from google.oauth2.credentials import Credentials
 
+from src.baseline import normalize_date
+
 
 def get_ga4_client(credentials: Credentials) -> BetaAnalyticsDataClient:
     return BetaAnalyticsDataClient(credentials=credentials)
@@ -61,7 +63,7 @@ def fetch_daily_event_counts(property_id: str, credentials: Credentials,
     result: dict[str, dict[str, int]] = {}
     for row in response.rows:
         event_name = row.dimension_values[0].value
-        day = row.dimension_values[1].value
+        day = normalize_date(row.dimension_values[1].value)
         count = int(row.metric_values[0].value)
         result.setdefault(event_name, {})[day] = count
     return result

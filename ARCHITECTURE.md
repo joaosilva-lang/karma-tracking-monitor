@@ -97,9 +97,14 @@ Há **dois programas independentes**:
 | `goback_days` | `10` | Janela larga de verificação, em dias (default 7 se vazio; máx. 90) |
 | `24hBackGA4_48hBackGAds` | `sim` / `não` | Força o check curto de zero para eventos de baixo volume (ver secção 5) |
 | `baseline_threshold_pct` | `40` | *(Opcional)* Limiar do WARN em % da mediana do dia-da-semana (vazio = 50). Aceita `40`, `40%` ou `0.4` |
+| `gtm_container_id` | `GTM-ABC123` | *(Opcional)* Container GTM do cliente — basta preencher numa linha do cliente |
+| `Nome_Tag_GTM` | `GA4 - Footer Contact` | *(Opcional, **preenchida pelo script**, não à mão)* Que tag GTM dispara este evento — puramente informativa |
 
-> A coluna `baseline_threshold_pct` é opcional na Sheet — o código tolera a sua ausência
-> (só exige as colunas que existirem na primeira linha).
+> As colunas opcionais podem nem existir na Sheet — o código tolera a ausência
+> (só exige as colunas que existirem na primeira linha). A `Nome_Tag_GTM` é a única
+> exceção ao princípio "a config é editada por humanos": o passo GTM do
+> `analyze_history.py` escreve **apenas** nessa coluna, em linhas existentes,
+> e nunca toca em mais nada (ver secção 5-bis).
 
 **Notas importantes:**
 - Uma linha por (cliente, plataforma, evento). O mesmo `client_id` aparece em várias linhas.
@@ -208,6 +213,31 @@ está limitado a 90.
 
 ---
 
+## 5-bis. Mapeamento evento → tag GTM (informativo)
+
+Os nomes dos eventos (GA4/GAds) diferem dos nomes das tags no GTM. Para a Sheet ser
+legível, o `analyze_history.py` preenche a coluna `Nome_Tag_GTM` da `config` com a(s)
+tag(s) GTM que disparam cada evento. **Só documentação — não entra em nenhum check.**
+
+O matching é **determinístico via Tag Manager API** (nada de LLM/inferência):
+- Lê a versão **publicada** (live) do container — o que dispara em produção, não o draft.
+- Tag GA4 Event (`gaawe`): o parâmetro `eventName` **é** o nome do evento → join direto.
+  Se o `eventName` usa variáveis (`{{...}}`), o nome é dinâmico e não é mapeável — a tag
+  é reportada no log do workflow e ignorada.
+- Tag de conversão GAds (`awct`): tem `conversionLabel`; do lado GAds, o label extrai-se
+  dos `tag_snippets` de cada conversion action (`fetch_conversion_labels` em
+  [src/gads.py](src/gads.py)) → join exato por label.
+
+Convenções na célula: múltiplas tags → `Tag A + Tag B`; tag pausada → `Nome (pausada)`;
+sem correspondência → `(sem tag GTM)`. O valor reflete o estado do container a cada
+corrida (é reescrito, não preservado).
+
+**Falha graciosa:** o passo GTM está isolado em try/except — sem scope no token, sem
+acesso ao container, ou container inexistente → aviso no log e a análise completa na
+mesma. O check diário (`main.py`) não usa o scope GTM de todo.
+
+---
+
 ## 6. Lógica de alertas
 
 | Situação | Sheet `results` | Slack |
@@ -233,10 +263,11 @@ Ver [src/slack.py](src/slack.py).
 | [main.py](main.py) | Orquestrador do check diário. Lê config, corre checks (janelas + baseline), escreve results, alerta. |
 | [src/baseline.py](src/baseline.py) | Helpers puros (sem APIs): janelas, mediana por dia-da-semana, decisão OK/WARN/FAIL, parsing do threshold. Testável com dados sintéticos. |
 | [src/ga4.py](src/ga4.py) | Acesso à GA4 Data API. `fetch_daily_event_counts` (breakdown diário, base de tudo) + `fetch_event_counts` (janela agregada, legado). |
-| [src/gads.py](src/gads.py) | Acesso à Google Ads API. `fetch_daily_conversion_counts` + `fetch_conversion_counts` (legado). |
+| [src/gads.py](src/gads.py) | Acesso à Google Ads API. `fetch_daily_conversion_counts` + `fetch_conversion_labels` (labels p/ matching GTM) + `fetch_conversion_counts` (legado). |
+| [src/gtm.py](src/gtm.py) | Acesso à Tag Manager API (versão live) + matching determinístico evento↔tag. Helpers puros testáveis sem APIs. |
 | [src/sheets.py](src/sheets.py) | Leitura da config e escrita das abas `results` / `history_analysis` / `daily_history`. Define os schemas (headers). |
 | [src/slack.py](src/slack.py) | Formata e envia o alerta Slack via Incoming Webhook (🔴/🟠 FAIL, 🟡 WARN). |
-| [analyze_history.py](analyze_history.py) | Análise de 90 dias on-demand → sugestões de 24h, medianas p/ calibração e aba `daily_history`. |
+| [analyze_history.py](analyze_history.py) | Análise de 90 dias on-demand → sugestões de 24h, medianas p/ calibração, aba `daily_history` e preenchimento da `Nome_Tag_GTM`. |
 | [setup_oauth.py](setup_oauth.py) | Fluxo OAuth local, uma vez. Gera os 3 valores p/ GitHub Secrets. |
 | [.github/workflows/daily_check.yml](.github/workflows/daily_check.yml) | Cron diário (08:00 UTC) + trigger manual. |
 | [.github/workflows/analyze_history.yml](.github/workflows/analyze_history.yml) | Trigger manual da análise de 90 dias. |
@@ -246,7 +277,13 @@ Ver [src/slack.py](src/slack.py).
 ## 8. Autenticação & segredos
 
 - **Auth:** OAuth2 com refresh token. Os scopes: `analytics.readonly`, `spreadsheets`,
-  `adwords`. As mesmas credenciais Google servem GA4, Sheets e Google Ads.
+  `adwords` e (desde jul 2026) `tagmanager.readonly`. As mesmas credenciais Google servem
+  GA4, Sheets, Google Ads e GTM.
+- **Atenção aos scopes:** um refresh token fica preso aos scopes consentidos quando foi
+  criado — não se acrescentam depois. Tokens gerados antes de jul 2026 não têm o scope
+  GTM: o check diário funciona na mesma (não o usa), mas o passo GTM do analyze é
+  saltado com aviso até correres `setup_oauth.py` de novo e atualizares o secret
+  `GOOGLE_REFRESH_TOKEN`.
 - **Google Ads + MCC:** o developer token pertence à MCC da Karma (ID `237-375-5574`).
   Por isso o `login_customer_id` tem de ser o ID da MCC, não o do cliente. O `customer_id`
   na query é o do cliente (que está sob a MCC).
@@ -288,6 +325,9 @@ Não há código a mudar. Só a Sheet:
   (configurável), automática para eventos com mediana ≥10/dia. Aba `daily_history` para
   visualização. Corrigido também o ponto cego em que um evento configurado totalmente
   morto desaparecia dos results sem FAIL.
+- ✅ **Mapeamento GTM** (jul 2026): coluna informativa `Nome_Tag_GTM` preenchida pelo
+  analyze_history via Tag Manager API — matching determinístico, sem LLM (a ideia
+  original de um workflow com LLM foi descartada: o join por `eventName`/label é exato).
 - ⏸️ **Meta Ads** — discutido, adiável. O modelo Sheet-driven já comporta uma `platform`
   nova; faltaria um `src/meta.py` análogo e o ramo respetivo em `main.py`.
 - ⏸️ **Verificação de valor/revenue** (não só contagem) — para clientes de e-commerce.

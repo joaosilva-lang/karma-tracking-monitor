@@ -13,6 +13,10 @@ SCOPES = [
     "https://www.googleapis.com/auth/analytics.readonly",
     "https://www.googleapis.com/auth/spreadsheets",
     "https://www.googleapis.com/auth/adwords",
+    # Read-only Tag Manager access, used by the analyze_history GTM step to
+    # fill the Nome_Tag_GTM column. Added 2026-07: tokens consented before
+    # this date lack it — re-run this script and update GOOGLE_REFRESH_TOKEN.
+    "https://www.googleapis.com/auth/tagmanager.readonly",
 ]
 
 # Path to the client_secret JSON downloaded from Google Cloud Console

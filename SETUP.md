@@ -12,14 +12,15 @@
 Use the existing Karma team GCP project — no need to create a new one.
 
 1. Go to [console.cloud.google.com](https://console.cloud.google.com) and open the existing Karma project
-2. Go to **APIs & Services → Library** and confirm these 3 APIs are enabled (enable if not):
+2. Go to **APIs & Services → Library** and confirm these 4 APIs are enabled (enable if not):
    - **Google Analytics Data API**
    - **Google Ads API**
    - **Google Sheets API**
+   - **Tag Manager API** (used by the analyze_history GTM-tag mapping step)
 3. If the OAuth consent screen is not yet configured: go to **APIs & Services → OAuth consent screen**
    - User type: **Internal**
    - App name: `Karma Tracking Monitor`
-   - Add scopes: `analytics.readonly`, `spreadsheets`, `adwords`
+   - Add scopes: `analytics.readonly`, `spreadsheets`, `adwords`, `tagmanager.readonly`
 4. Go to **APIs & Services → Credentials → Create Credentials → OAuth client ID**
    - Application type: **Desktop app**
    - Name: `karma-tracking-monitor`
@@ -47,6 +48,12 @@ python setup_oauth.py
 A browser window will open — log in with your Google account and grant access.  
 The script prints 3 values: `GOOGLE_CLIENT_ID`, `GOOGLE_CLIENT_SECRET`, `GOOGLE_REFRESH_TOKEN`.  
 **Copy them immediately — you'll add them as GitHub Secrets in Step 5.**
+
+> **Note:** a refresh token is permanently bound to the scopes consented when it was
+> created. Whenever a scope is added to `setup_oauth.py` (e.g. `tagmanager.readonly`,
+> added Jul 2026), re-run this script and replace the `GOOGLE_REFRESH_TOKEN` secret.
+> Until you do, features needing the new scope are skipped with a warning; everything
+> else keeps working.
 
 ---
 
@@ -122,15 +129,13 @@ Check the Sheet for a new `results` tab and your Slack channel for any critical 
 
 ## Adding a New Client
 
-1. Add a file `clients/CLIENTNAME.json`:
-   ```json
-   {
-     "id": "clientname",
-     "name": "Client Display Name",
-     "ga4_property_id": "XXXXXXXXX",
-     "gads_customer_id": "XXXXXXXXXX",
-     "gads_login_customer_id": "XXXXXXXXXX"
-   }
-   ```
-2. Add the client's events to the `config` tab of the Google Sheet
-3. Ensure your OAuth credentials have access to the new client's GA4 and GAds accounts
+No code changes — everything lives in the Sheet. See "Como adicionar um novo cliente"
+in [ARCHITECTURE.md](ARCHITECTURE.md) for the full walkthrough. In short:
+
+1. Add one row per (platform, event) to the `config` tab, with the client's
+   `client_id` and `account_id` (GA4 property ID or GAds customer ID); optionally
+   fill `gtm_container_id` (e.g. `GTM-ABC123`) to enable the GTM tag mapping
+2. Ensure your Google account has access to the client's GA4 property, GAds account
+   (under the Karma MCC) and GTM container
+3. (Optional) Run the **90-Day History Analysis** workflow to get 24h-check
+   suggestions and baseline calibration data for the new client's events

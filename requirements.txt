@@ -3,4 +3,5 @@ google-ads==31.1.0
 gspread==6.1.2
 google-auth==2.29.0
 google-auth-oauthlib==1.2.0
+google-api-python-client==2.155.0
 requests==2.31.0

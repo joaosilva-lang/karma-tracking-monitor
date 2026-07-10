@@ -7,12 +7,17 @@ RESULTS_TAB = "results"
 HISTORY_TAB = "history_analysis"
 DAILY_TAB = "daily_history"
 
-# baseline_threshold_pct is optional: WARN threshold for the relative check,
-# as a percentage of the weekday median (empty -> 50%).
+# Optional columns: baseline_threshold_pct is the WARN threshold for the
+# relative check as a % of the weekday median (empty -> 50%);
+# gtm_container_id (GTM-XXXXXX, one non-empty value per client is enough) and
+# Nome_Tag_GTM (filled by the analyze_history GTM step, never by hand) drive
+# the informational event->GTM-tag mapping.
 CONFIG_HEADERS = [
     "client_id", "account_id", "platform", "event_name",
     "severity", "goback_days", "24hBackGA4_48hBackGAds", "baseline_threshold_pct",
+    "gtm_container_id", "Nome_Tag_GTM",
 ]
+GTM_TAG_COLUMN = "Nome_Tag_GTM"
 DEFAULT_GOBACK_DAYS = 7
 
 # `window` distinguishes the short 24h-style check ("24h"/"48h") from the
@@ -51,6 +56,44 @@ def read_config(sheet_id: str, client: gspread.Client) -> list[dict]:
     expected = [h for h in CONFIG_HEADERS if h in present]
     records = ws.get_all_records(expected_headers=expected)
     return [r for r in records if r.get("client_id") and r.get("event_name")]
+
+
+def update_config_gtm_tags(sheet_id: str, client: gspread.Client,
+                           values_by_key: dict[tuple[str, str, str], str]) -> int:
+    """Surgically fills the Nome_Tag_GTM column of the config tab.
+
+    values_by_key: {(client_id, PLATFORM_UPPER, event_name): cell_value}.
+    Only cells in that one column are touched — rows are matched in place,
+    never created, and no other column is written. Returns how many cells
+    were updated; 0 if the column doesn't exist in the Sheet yet.
+    """
+    sh = client.open_by_key(sheet_id)
+    ws = sh.worksheet(CONFIG_TAB)
+
+    header = ws.row_values(1)
+    if GTM_TAG_COLUMN not in header:
+        return 0
+    tag_col = header.index(GTM_TAG_COLUMN) + 1  # 1-based
+
+    def col_index(name: str) -> int | None:
+        return header.index(name) if name in header else None
+
+    ci, pi, ei = col_index("client_id"), col_index("platform"), col_index("event_name")
+    if None in (ci, pi, ei):
+        return 0
+
+    updates = []
+    for row_number, row in enumerate(ws.get_all_values()[1:], start=2):
+        def cell(idx):
+            return row[idx].strip() if idx < len(row) else ""
+
+        key = (cell(ci), cell(pi).upper(), cell(ei))
+        if key in values_by_key:
+            updates.append(gspread.Cell(row_number, tag_col, values_by_key[key]))
+
+    if updates:
+        ws.update_cells(updates, value_input_option="RAW")
+    return len(updates)
 
 
 def write_results(sheet_id: str, client: gspread.Client, rows: list[dict]) -> None:

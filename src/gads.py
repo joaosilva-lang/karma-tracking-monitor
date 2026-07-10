@@ -2,6 +2,8 @@ from datetime import date, timedelta
 from google.ads.googleads.client import GoogleAdsClient
 from google.ads.googleads.errors import GoogleAdsException
 
+from src.gtm import extract_conversion_label
+
 
 def get_gads_client(client_id: str, client_secret: str, refresh_token: str,
                     developer_token: str, login_customer_id: str) -> GoogleAdsClient:
@@ -82,3 +84,38 @@ def fetch_daily_conversion_counts(customer_id: str, client: GoogleAdsClient,
         ) from ex
 
     return result
+
+
+def fetch_conversion_labels(customer_id: str, client: GoogleAdsClient) -> dict[str, str]:
+    """Returns {conversion_action_name: conversion_label} for enabled actions.
+
+    The label (the part after the slash in send_to 'AW-XXXX/label') lives in
+    the action's tag snippets; it's what GTM `awct` tags reference, so it is
+    the join key between GAds conversion actions and GTM tags.
+    """
+    ga_service = client.get_service("GoogleAdsService")
+
+    query = """
+        SELECT
+            conversion_action.name,
+            conversion_action.tag_snippets
+        FROM conversion_action
+        WHERE conversion_action.status = 'ENABLED'
+    """
+
+    labels: dict[str, str] = {}
+
+    try:
+        response = ga_service.search(customer_id=customer_id, query=query)
+        for row in response:
+            for snippet in row.conversion_action.tag_snippets:
+                label = extract_conversion_label(snippet.event_snippet)
+                if label:
+                    labels[row.conversion_action.name] = label
+                    break
+    except GoogleAdsException as ex:
+        raise RuntimeError(
+            f"GAds API error for customer {customer_id}: {ex.error.code().name}"
+        ) from ex
+
+    return labels

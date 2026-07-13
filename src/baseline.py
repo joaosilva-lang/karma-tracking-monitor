@@ -25,6 +25,11 @@ GOBACK_SUGGEST_MIN = 3
 GOBACK_SUGGEST_MAX = 90
 GOBACK_SUGGEST_FACTOR = 1.5
 
+# The record-silence WARN needs at least this many fired days of history —
+# below it, max_zero_gap rests on a single observation and "record-breaking"
+# means nothing statistically.
+RECORD_SILENCE_MIN_FIRED_DAYS = 3
+
 
 def normalize_date(value: str) -> str:
     """GA4 returns dates as YYYYMMDD, GAds as YYYY-MM-DD. Normalize to ISO."""
@@ -112,6 +117,18 @@ def max_zero_gap(day_map: dict[str, float], dates: list[str]) -> int:
     for prev, nxt in zip(firing_idx, firing_idx[1:]):
         gap = max(gap, nxt - prev - 1)
     return gap
+
+
+def days_since_last_firing(day_map: dict[str, float], dates: list[str]) -> int | None:
+    """Length of the CURRENT dry spell: zero-count days at the tail of `dates`
+    (oldest first, ending at the platform's stable day). 0 = fired on the last
+    date; None = never fired in the window. Same units as max_zero_gap, so
+    `dry > max_zero_gap(...)` means the current silence beats every silence
+    observed between firings."""
+    for i, d in enumerate(reversed(dates)):
+        if day_map.get(d, 0) > 0:
+            return i
+    return None
 
 
 def suggest_goback_days(max_gap: int) -> int:

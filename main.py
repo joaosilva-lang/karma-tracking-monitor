@@ -7,8 +7,11 @@ from google.oauth2.credentials import Credentials
 from src.baseline import (
     BASELINE_DAYS,
     BASELINE_MIN_MEDIAN,
+    RECORD_SILENCE_MIN_FIRED_DAYS,
     date_range,
+    days_since_last_firing,
     is_value_carrying,
+    max_zero_gap,
     parse_threshold,
     short_check_status,
     weekday_median,
@@ -108,7 +111,7 @@ def _fetch_daily(account_id: str, platform: str, credentials: Credentials,
 
 def _row(client_id: str, platform: str, event_name: str, severity: str,
          window: str, count: float, status: str, expected: float = None,
-         check: str = "count", history: dict = None) -> dict:
+         check: str = "count", history: dict = None, dry_days: int = None) -> dict:
     return {
         "client_id": client_id,
         "platform": platform,
@@ -119,8 +122,10 @@ def _row(client_id: str, platform: str, event_name: str, severity: str,
         "count": round(count, 2) if check == "value" else int(round(count)),
         "status": status,
         "expected": round(expected, 1) if expected is not None else "",
-        # Not written to the Sheet — carried along for triage context.
+        # Not written to the Sheet — carried along for Slack/triage context.
         "history": history or {},
+        # Set only on record-silence WARN rows (current dry spell length).
+        "dry_days": dry_days,
     }
 
 
@@ -160,18 +165,37 @@ def _check_platform(client_id: str, platform: str, display_name: str, account_id
         value_map = daily_values.get(event_name, {})
         history = recent(day_map)
 
+        expected = weekday_median(day_map, test_day)
+
         # --- Wide goback-window check (one row per event) ---
+        # FAIL: zero events in the whole window (as always). WARN (record
+        # silence): the CURRENT dry spell is longer than any silence observed
+        # between firings in 90 days — the earliest statistically defensible
+        # death signal for sporadic events, long before the FAIL at
+        # goback_days. Guards: only events without the automatic baseline
+        # (high-volume ones already FAIL same-day via the short check), not
+        # 24h-flagged (their zero-check fires same-day too), and with enough
+        # fired days for the record to mean anything.
         goback_days = min(cfg["goback_days"], BASELINE_DAYS)
         wide_count = window_count(day_map, yesterday, goback_days)
+        wide_status, record_gap, dry = "OK" if wide_count > 0 else "FAIL", None, None
+        if (wide_status == "OK" and expected < BASELINE_MIN_MEDIAN
+                and event_name not in flagged):
+            stable_dates = date_range(test_day, BASELINE_DAYS)
+            fired_days = sum(1 for d in stable_dates if day_map.get(d, 0) > 0)
+            if fired_days >= RECORD_SILENCE_MIN_FIRED_DAYS:
+                gap = max_zero_gap(day_map, stable_dates)
+                current_dry = days_since_last_firing(day_map, stable_dates)
+                if current_dry is not None and current_dry > gap:
+                    wide_status, record_gap, dry = "WARN", gap, current_dry
         results.append(_row(
             client_id, display_name, event_name, cfg["severity"],
-            f"{goback_days}d", wide_count, "OK" if wide_count > 0 else "FAIL",
-            history=history,
+            f"{goback_days}d", wide_count, wide_status,
+            expected=record_gap, dry_days=dry, history=history,
         ))
 
         # --- Short check: automatic baseline above the volume floor, plain
         # zero-check for events explicitly flagged 24hBackGA4_48hBackGAds=sim ---
-        expected = weekday_median(day_map, test_day)
         if expected >= BASELINE_MIN_MEDIAN:
             count = day_map.get(test_day.isoformat(), 0)
             status = short_check_status(count, expected, cfg["threshold"])

@@ -19,6 +19,13 @@ def _format_line(f: dict) -> str:
             f"💰 {prefix} — eventos registados *SEM valor* "
             f"{_window_phrase(f['window'])} (contagem OK, valor a zero)"
         )
+    if f["status"] == "WARN" and f.get("dry_days") is not None:
+        # Record-silence WARN on the wide window: the current dry spell beats
+        # every silence observed in 90 days (expected holds that record).
+        return (
+            f"🟡 {prefix} — *silêncio recorde: {f['dry_days']} dia(s) sem eventos* "
+            f"(máx. histórico {f['expected']:g}d; FAIL aos {f['window'].rstrip('d')}d)"
+        )
     if f["status"] == "WARN" and f.get("expected"):
         expected = f["expected"]
         pct_below = round((1 - f["count"] / expected) * 100)

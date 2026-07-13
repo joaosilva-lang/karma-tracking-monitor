@@ -157,7 +157,7 @@ Recriada a cada corrida. Ajuda-te a preencher a coluna `24hBackGA4_48hBackGAds`:
 | `pct_days_with_value` | Dos dias em que o evento disparou, em quantos % trouxe valor > 0 |
 | `value_carrying` | `sim` se o evento entra no check automático de valor (secção 5-ter) |
 | `max_gap_days` | Maior sequência de dias consecutivos a zero **entre dois disparos** nos 90 dias (zeros à cabeça/cauda não contam — a cauda seria lag de atribuição GAds ou uma avaria em curso, não um padrão) |
-| `goback_days_sugerido` | `ceil(max_gap_days × 1.5)`, mín. 3, máx. 90 — o lookback mais apertado que não teria dado nenhum falso alarme nos 90 dias observados |
+| `goback_days_sugerido` | `ceil(max_gap_days × 1.5)`, mín. 3, máx. 90 — o lookback mais apertado que não teria dado nenhum falso alarme nos 90 dias observados. Um valor alto não significa deteção lenta: o WARN de silêncio-recorde (secção 5) dispara logo a `max_gap+1` dias |
 | `suggestion_24h` | `sim` só se `max_gap_days == 0` (não falhou um único dia em 90 — qualquer gap observado faria o flag 24h dar falsos FAIL) |
 
 **Workflow de uso:** corres `analyze_history.py` → copias o `goback_days_sugerido` para a
@@ -198,6 +198,19 @@ Cada evento pode ser verificado em **duas janelas com propósitos distintos**:
 - Boa para saúde geral / tendência. Numa janela larga, quase todos os eventos relevantes
   disparam pelo menos uma vez, por isso `count == 0` é um sinal forte de que algo partiu.
 - Configurável por evento (coluna `goback_days`).
+- **WARN de silêncio-recorde** (jul 2026): o FAIL binário só dispara com a janela toda a
+  zero — num evento esporádico com `goback=30`, uma morte demoraria 30 dias a alertar.
+  Por isso a janela larga ganhou um estado intermédio: **WARN quando o silêncio atual
+  ultrapassa o maior silêncio observado entre disparos nos últimos 90 dias** (`max_gap`).
+  "Nunca em 90 dias esteve tantos dias calado" é o sinal de morte mais cedo que se
+  consegue sem falsos FAIL — na prática a latência de deteção passa de `1.5×max_gap`
+  (FAIL) para `max_gap+1` (WARN). Guardas para não gerar ruído: só eventos **sem**
+  baseline automática (os de alto volume já FAILam no próprio dia no check curto), **não**
+  flagged 24h/48h (o zero-check deles já dispara no próprio dia), com **≥3 dias de
+  disparo** nos 90 (senão o recorde é uma observação única) e silêncio medido até ao dia
+  estável da plataforma (o lag GAds de ontem não conta). Na aba `results`, a coluna
+  `expected` destas linhas mostra o recorde histórico; no Slack: *"silêncio recorde: 8
+  dia(s) sem eventos (máx. histórico 2d; FAIL aos 30d)"*.
 
 ### Janela curta (24h/48h) — automática acima do volume mínimo, opt-in abaixo
 - "Este evento disparou no último dia *estável*, e em volume normal?" — deteção rápida

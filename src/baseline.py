@@ -4,6 +4,7 @@ Everything here operates on {iso_date: count} maps and stdlib types only (no
 API clients), so it can be unit-tested with synthetic data.
 """
 from datetime import date, timedelta
+from math import ceil
 from statistics import median
 
 BASELINE_DAYS = 90
@@ -17,6 +18,12 @@ BASELINE_THRESHOLD_DEFAULT = 0.5
 # MIN_VALUE_DAYS fired days of evidence.
 MIN_VALUE_DAYS = 10
 VALUE_CARRYING_PCT = 0.80
+
+# Suggested goback_days = the longest observed dry spell x a safety factor,
+# clamped: never tighter than 3 days, never wider than the analysis window.
+GOBACK_SUGGEST_MIN = 3
+GOBACK_SUGGEST_MAX = 90
+GOBACK_SUGGEST_FACTOR = 1.5
 
 
 def normalize_date(value: str) -> str:
@@ -89,6 +96,31 @@ def is_value_carrying(counts_map: dict[str, float], values_map: dict[str, float]
     day with count>0 and value==0 is genuinely anomalous."""
     fired_days, pct = pct_days_with_value(counts_map, values_map, dates)
     return fired_days >= MIN_VALUE_DAYS and pct >= VALUE_CARRYING_PCT
+
+
+def max_zero_gap(day_map: dict[str, float], dates: list[str]) -> int:
+    """Longest run of consecutive zero-count days strictly BETWEEN the first
+    and last firing day in `dates` (oldest first). Leading/trailing zeros are
+    excluded on purpose: they aren't gaps between firings — a trailing run is
+    either attribution lag (GAds) or an ongoing outage, and neither should
+    inflate the suggested lookback. An event that never fired returns
+    len(dates) (dead for the whole window)."""
+    firing_idx = [i for i, d in enumerate(dates) if day_map.get(d, 0) > 0]
+    if not firing_idx:
+        return len(dates)
+    gap = 0
+    for prev, nxt in zip(firing_idx, firing_idx[1:]):
+        gap = max(gap, nxt - prev - 1)
+    return gap
+
+
+def suggest_goback_days(max_gap: int) -> int:
+    """Suggested goback_days for the wide check: the longest observed dry
+    spell plus a proportional margin, clamped to [GOBACK_SUGGEST_MIN,
+    GOBACK_SUGGEST_MAX]. Zero false positives on the observed history by
+    construction (window always exceeds every gap actually seen)."""
+    return min(GOBACK_SUGGEST_MAX,
+               max(GOBACK_SUGGEST_MIN, ceil(max_gap * GOBACK_SUGGEST_FACTOR)))
 
 
 def short_check_status(count: float, expected: float, threshold: float) -> str:

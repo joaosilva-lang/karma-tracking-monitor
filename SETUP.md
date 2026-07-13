@@ -107,7 +107,7 @@ The script prints 3 values: `GOOGLE_CLIENT_ID`, `GOOGLE_CLIENT_SECRET`, `GOOGLE_
    | `GOOGLE_ADS_DEVELOPER_TOKEN` | from Step 2 |
    | `GOOGLE_SHEET_ID` | from Step 4 |
    | `SLACK_WEBHOOK_URL` | from your Slack app |
-   | `GEMINI_API_KEY` *(optional)* | from [aistudio.google.com](https://aistudio.google.com) — enables the automatic triage agent (a Gemini-written diagnosis posted to Slack after critical alerts). Without it the triage step is a silent no-op. |
+   | `GEMINI_API_KEY` *(optional)* | from [aistudio.google.com](https://aistudio.google.com) — enables the automatic triage agent (a Gemini-written diagnosis posted to Slack after critical alerts) and phrases the weekly config-divergence digest. Without it the triage step is a silent no-op and the digest falls back to a plain deterministic list. |
 
 ---
 

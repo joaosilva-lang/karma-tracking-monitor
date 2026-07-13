@@ -26,7 +26,8 @@ GTM_PARAMS_COLUMN = "GTM_Event_Params"
 # copy-paste straight into config, followed by these informational stats.
 STAT_HEADERS = [
     "median_per_day", "pct_days", "pct_days_with_value",
-    "value_carrying", "weekday_medians",
+    "value_carrying", "max_gap_days", "goback_days_sugerido",
+    "weekday_medians",
 ]
 # Fallback header order used only when the config tab doesn't exist yet.
 PROPOSAL_HEADERS = CONFIG_HEADERS + STAT_HEADERS
@@ -47,7 +48,8 @@ HISTORY_HEADERS = [
     "analyzed_at", "client_id", "platform", "event_name",
     "days_fired_of_90", "pct_days", "avg_per_day",
     "median_per_day", "weekday_medians",
-    "pct_days_with_value", "value_carrying", "suggestion_24h",
+    "pct_days_with_value", "value_carrying",
+    "max_gap_days", "goback_days_sugerido", "suggestion_24h",
 ]
 
 
@@ -163,6 +165,8 @@ def write_history_analysis(sheet_id: str, client: gspread.Client, rows: list[dic
             row["weekday_medians"],
             row["pct_days_with_value"],
             row["value_carrying"],
+            row["max_gap_days"],
+            row["goback_days_sugerido"],
             row["suggestion_24h"],
         ])
     ws.update(table, value_input_option="RAW")

@@ -125,7 +125,10 @@ def main() -> None:
                 "platform": display,
                 "event_name": event_name,
                 "severity": "secondary",
-                "goback_days": "",
+                # Pre-filled from the gap analysis (longest dry spell x1.5),
+                # so reviewed rows are copy-paste-ready; adjust before copying
+                # if you disagree.
+                "goback_days": stats["goback_days_sugerido"],
                 "24hBackGA4_48hBackGAds": flag,
                 "baseline_threshold_pct": "",
                 "gtm_container_id": gtm_container,
@@ -135,6 +138,8 @@ def main() -> None:
                 "pct_days": stats["pct_days"],
                 "pct_days_with_value": stats["pct_days_with_value"],
                 "value_carrying": stats["value_carrying"],
+                "max_gap_days": stats["max_gap_days"],
+                "goback_days_sugerido": stats["goback_days_sugerido"],
                 "weekday_medians": stats["weekday_medians"],
             })
 

@@ -29,7 +29,14 @@ import os
 from datetime import date, timedelta
 from statistics import median
 
-from src.baseline import date_range, pct_days_with_value, is_value_carrying, per_weekday_medians
+from src.baseline import (
+    date_range,
+    is_value_carrying,
+    max_zero_gap,
+    pct_days_with_value,
+    per_weekday_medians,
+    suggest_goback_days,
+)
 from src.ga4 import fetch_daily_event_data
 from src.gads import fetch_conversion_labels, fetch_daily_conversion_data, get_gads_client
 from src.gtm import (
@@ -42,6 +49,7 @@ from src.gtm import (
     resolve_container,
 )
 from src.sheets import (
+    DEFAULT_GOBACK_DAYS,
     GTM_PARAMS_COLUMN,
     GTM_TAG_COLUMN,
     get_sheets_client,
@@ -50,10 +58,12 @@ from src.sheets import (
     write_daily_history,
     write_history_analysis,
 )
-from main import build_credentials, build_client_accounts
+from main import build_credentials, build_client_accounts, TRUTHY
 
 ANALYSIS_DAYS = 90
-SUGGESTION_THRESHOLD = 0.80  # fired on >= 80% of days -> suggest 'sim'
+# Config goback_days wider than suggested by more than this margin is
+# reported in the digest as unnecessarily slow detection.
+DIGEST_SLOW_MARGIN = 2
 
 WEEKDAY_LABELS = ["Seg", "Ter", "Qua", "Qui", "Sex", "Sáb", "Dom"]
 
@@ -70,6 +80,7 @@ def summarize_events(counts_by_event: dict, values_by_event: dict, client_id: st
         weekday_meds = per_weekday_medians(day_map, dates)
         value_map = values_by_event.get(event_name, {})
         _, value_pct = pct_days_with_value(day_map, value_map, dates)
+        max_gap = max_zero_gap(day_map, dates)
         rows.append({
             "client_id": client_id,
             "platform": display_platform,
@@ -83,7 +94,12 @@ def summarize_events(counts_by_event: dict, values_by_event: dict, client_id: st
             ),
             "pct_days_with_value": f"{round(value_pct * 100)}%",
             "value_carrying": "sim" if is_value_carrying(day_map, value_map, dates) else "não",
-            "suggestion_24h": "sim" if pct >= SUGGESTION_THRESHOLD else "não",
+            "max_gap_days": max_gap,
+            "goback_days_sugerido": suggest_goback_days(max_gap),
+            # 24h/48h flag is a plain zero-check, so only events that never
+            # missed a single day in the window qualify — one observed gap
+            # means the flag would false-FAIL on days like it.
+            "suggestion_24h": "sim" if max_gap == 0 else "não",
         })
     # Most-frequent first, so the best 24h candidates surface at the top.
     rows.sort(key=lambda r: r["days_fired_of_90"], reverse=True)
@@ -199,6 +215,95 @@ def map_gtm_tags(config_rows: list[dict], sheet_id: str, sheets_client) -> None:
                   "in config — add them to the Sheet header to enable writing.")
 
 
+def find_config_divergences(config_rows: list[dict], all_rows: list[dict]) -> list[str]:
+    """Deterministic comparison of the config's goback_days / 24h flags
+    against the 90-day gap analysis. Returns one human-readable line per
+    divergence (empty list = config aligned with history)."""
+    stats_by_key = {
+        (r["client_id"], r["platform"].upper(), r["event_name"]): r
+        for r in all_rows
+    }
+    divergences = []
+    for row in config_rows:
+        key = (row["client_id"], row["platform"].upper(), row["event_name"])
+        stats = stats_by_key.get(key)
+        if not stats:
+            continue
+        max_gap = stats["max_gap_days"]
+        suggested = stats["goback_days_sugerido"]
+        try:
+            cfg_goback = int(row["goback_days"]) if row.get("goback_days") else DEFAULT_GOBACK_DAYS
+        except (TypeError, ValueError):
+            cfg_goback = DEFAULT_GOBACK_DAYS
+        flagged = str(row.get("24hBackGA4_48hBackGAds", "")).strip().lower() in TRUTHY
+        label = f"{row['client_id']} | {stats['platform']} | {row['event_name']}"
+
+        if flagged and max_gap > 0:
+            divergences.append(
+                f"{label}: flag 24h/48h ativo, mas o evento esteve até {max_gap} dia(s) "
+                f"seguidos a zero nos últimos 90 — o flag vai dar falsos FAIL em dias assim; "
+                f"sugerido: remover o flag e usar goback_days={suggested}.")
+        if cfg_goback < suggested:
+            divergences.append(
+                f"{label}: goback_days={cfg_goback}, mas o maior gap real foi {max_gap} dia(s) "
+                f"(sugerido {suggested}) — risco de falso alarme.")
+        elif cfg_goback > suggested + DIGEST_SLOW_MARGIN:
+            divergences.append(
+                f"{label}: goback_days={cfg_goback} vs sugerido {suggested} — uma morte real "
+                f"do evento pode demorar até {cfg_goback} dias a ser detetada.")
+    return divergences
+
+
+DIGEST_PROMPT = """És um especialista em web analytics da agência Karma. O monitor de tracking
+comparou a configuração atual com a análise dos últimos 90 dias e encontrou as
+divergências abaixo (uma por linha, já com os números certos).
+
+Reescreve isto como um digest Slack curto em português de Portugal: agrupa por
+cliente, mantém EXATAMENTE os números e nomes de eventos, e termina com uma
+recomendação de ação concreta por cliente (1 frase). Sem introdução nem
+conclusão genérica. Usa • como bullet.
+
+Divergências:
+{lines}
+"""
+
+
+def send_weekly_digest(config_rows: list[dict], all_rows: list[dict]) -> None:
+    """Posts the goback_days divergence digest to Slack. Detection is
+    deterministic; Gemini (when configured) only phrases the message — on any
+    Gemini failure the plain deterministic list is posted instead. No
+    divergences -> no message. Fail-safe: never fails the job."""
+    try:
+        slack_webhook = os.environ.get("SLACK_WEBHOOK_URL", "")
+        if not slack_webhook:
+            print("Digest: SLACK_WEBHOOK_URL not configured — skipping.")
+            return
+
+        divergences = find_config_divergences(config_rows, all_rows)
+        if not divergences:
+            print("Digest: config alinhada com o histórico — nada a reportar.")
+            return
+
+        body = "\n".join(f"• {line}" for line in divergences)
+        api_key = os.environ.get("GEMINI_API_KEY", "")
+        if api_key:
+            try:
+                from triage import call_gemini
+                phrased = call_gemini(api_key, DIGEST_PROMPT.format(lines=body))
+                if phrased:
+                    body = phrased
+            except Exception as exc:
+                print(f"Digest: Gemini indisponível ({exc}) — a enviar versão plain.")
+
+        import requests
+        message = (f"📋 *Digest semanal — goback_days vs histórico (90d)* "
+                   f"({len(divergences)} divergência(s))\n{body}")
+        requests.post(slack_webhook, json={"text": message}, timeout=10).raise_for_status()
+        print(f"Digest: {len(divergences)} divergência(s) enviadas para o Slack.")
+    except Exception as exc:
+        print(f"Digest failed (analysis unaffected): {exc}")
+
+
 def main() -> None:
     sheet_id = os.environ["GOOGLE_SHEET_ID"]
 
@@ -234,6 +339,7 @@ def main() -> None:
     print(f"Wrote daily_history: {len(dates)} days x {len(all_series)} series.")
 
     map_gtm_tags(config_rows, sheet_id, sheets_client)
+    send_weekly_digest(config_rows, all_rows)
 
 
 if __name__ == "__main__":

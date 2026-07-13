@@ -156,11 +156,29 @@ Recriada a cada corrida. Ajuda-te a preencher a coluna `24hBackGA4_48hBackGAds`:
 | `weekday_medians` | Mediana por dia-da-semana (`Seg 12 · Ter 14 · …`) — para calibrar o `baseline_threshold_pct` |
 | `pct_days_with_value` | Dos dias em que o evento disparou, em quantos % trouxe valor > 0 |
 | `value_carrying` | `sim` se o evento entra no check automático de valor (secção 5-ter) |
-| `suggestion_24h` | `sim` se disparou em ≥80% dos dias, senão `não` |
+| `max_gap_days` | Maior sequência de dias consecutivos a zero **entre dois disparos** nos 90 dias (zeros à cabeça/cauda não contam — a cauda seria lag de atribuição GAds ou uma avaria em curso, não um padrão) |
+| `goback_days_sugerido` | `ceil(max_gap_days × 1.5)`, mín. 3, máx. 90 — o lookback mais apertado que não teria dado nenhum falso alarme nos 90 dias observados |
+| `suggestion_24h` | `sim` só se `max_gap_days == 0` (não falhou um único dia em 90 — qualquer gap observado faria o flag 24h dar falsos FAIL) |
 
-**Workflow de uso:** corres `analyze_history.py` → vês as sugestões → copias `sim`/`não`
-para a coluna `24hBackGA4_48hBackGAds` da aba `config` nos eventos de baixo volume que decidires
-vigiar; usas as medianas para ajustar thresholds.
+**Workflow de uso:** corres `analyze_history.py` → copias o `goback_days_sugerido` para a
+coluna `goback_days` da `config` nos eventos que importam, e `sim` para
+`24hBackGA4_48hBackGAds` apenas nos eventos com `suggestion_24h=sim`; usas as medianas
+para ajustar thresholds. O digest semanal (abaixo) avisa-te quando a config diverge
+destas sugestões.
+
+### Digest semanal de divergências — Slack, no fim do `analyze_history.py`
+
+No fim de cada análise, `find_config_divergences` compara **deterministicamente** a
+config atual com as sugestões e reporta no Slack (mesmo webhook dos alertas):
+
+- `goback_days` configurado **menor** que o sugerido → risco de falso alarme;
+- `goback_days` configurado **maior** que o sugerido + 2 → deteção desnecessariamente lenta;
+- flag `24hBackGA4_48hBackGAds=sim` num evento com `max_gap_days > 0` → o flag vai gerar falsos FAIL.
+
+Sem divergências → sem mensagem. Com `GEMINI_API_KEY` configurada, o Gemini apenas
+**redige** o digest (agrupa por cliente, acrescenta recomendação); a deteção nunca é do
+LLM, e qualquer falha do Gemini faz cair para a lista determinística plain. Fail-safe
+total: nenhum erro do digest falha o job (padrão do triage).
 
 ### Aba `daily_history` — escrita pelo `analyze_history.py`
 
@@ -199,7 +217,10 @@ Cada evento pode ser verificado em **duas janelas com propósitos distintos**:
 - **Flag `24hBackGA4_48hBackGAds=sim`** — continua a existir para eventos **abaixo** do volume
   mínimo que queiras mesmo assim vigiar diariamente: recebem só o check de zero
   (`OK`/`FAIL`), sem WARN, porque em baixo volume a comparação percentual é ruído.
-  A sugestão do `analyze_history.py` (≥80% de dias com disparo) mantém-se para este flag.
+  O `analyze_history.py` só sugere este flag a eventos que **não falharam um único dia
+  em 90** (`max_gap_days == 0`); para os restantes, a resposta certa é a janela larga
+  com o `goback_days_sugerido` da análise de gaps (o flag daria falsos FAIL nos dias
+  de silêncio natural do evento — foi o caso purchase/Reserva de jul 2026).
 
 #### Por que GA4 testa "ontem" mas GAds testa "anteontem"
 GA4 processa os eventos rápido — os dados de "ontem" já estão estáveis. O **Google Ads tem
@@ -382,7 +403,8 @@ Não há código a mudar. O caminho recomendado é o **workflow de onboarding**:
 - ✅ Config 100% Sheet-driven (migrámos de ficheiros JSON por cliente).
 - ✅ `goback_days` configurável por evento (máx. 90).
 - ✅ Check curto com janela ajustada à plataforma (GA4 testa ontem / GAds testa anteontem).
-- ✅ Análise de 90 dias para sugerir candidatos a 24h (limiar 80%).
+- ✅ Análise de 90 dias para sugerir candidatos a 24h (limiar 80% → substituído
+  em jul 2026 pelo critério de gap zero, abaixo).
 - ✅ **Baseline relativa** (jul 2026): mediana por dia-da-semana, WARN abaixo de 50%
   (configurável), automática para eventos com mediana ≥10/dia. Aba `daily_history` para
   visualização. Corrigido também o ponto cego em que um evento configurado totalmente
@@ -398,6 +420,11 @@ Não há código a mudar. O caminho recomendado é o **workflow de onboarding**:
 - ✅ **Triagem agentic** (jul 2026): `triage.py` com Gemini (`gemini-2.5-flash`),
   gated pelo secret `GEMINI_API_KEY` — decisão de custo: Gemini (free tier) em vez da
   API Anthropic. O alerta determinístico nunca depende do agente.
+- ✅ **Análise de gaps + digest** (jul 2026): `goback_days_sugerido = ceil(max_gap × 1.5)`
+  (clamp 3–90, só gaps fechados) nas abas `history_analysis`/`config_proposta`;
+  `suggestion_24h` apertada para `max_gap == 0`; onboarding pré-preenche `goback_days`;
+  digest semanal Slack de divergências config↔histórico (deteção determinística,
+  Gemini só redige). Motivado pelos falsos FAIL de purchase/Reserva (Verdelago).
 - ⏸️ **Meta Ads** — discutido, adiável. O modelo Sheet-driven já comporta uma `platform`
   nova; faltaria um `src/meta.py` análogo e o ramo respetivo em `main.py`.
 - ⏸️ **Renomeação de eventos** — considerada (jun 2026) e adiada: os nomes atuais são

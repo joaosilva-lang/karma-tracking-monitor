@@ -102,7 +102,9 @@ def call_gemini(api_key: str, prompt: str) -> str:
     from google import genai
 
     client = genai.Client(api_key=api_key)
-    model = os.environ.get("GEMINI_MODEL", GEMINI_MODEL_DEFAULT)
+    # `or` (not .get's default) because the workflow always sets GEMINI_MODEL
+    # from an optional Actions variable — unset there means "", not absent.
+    model = os.environ.get("GEMINI_MODEL") or GEMINI_MODEL_DEFAULT
     response = client.models.generate_content(model=model, contents=prompt)
     return (response.text or "").strip()
 

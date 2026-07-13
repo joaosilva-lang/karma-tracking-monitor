@@ -75,11 +75,15 @@ ativamente** quando algo pára.
                     (só FAIL + critical)
 ```
 
-Há **dois programas independentes**:
+Há **quatro programas independentes**:
 
 - **`main.py`** — o check diário. Corre via GitHub Actions todos os dias às 08:00 UTC.
-- **`analyze_history.py`** — análise on-demand de 90 dias que te ajuda a decidir que
-  eventos pôr no check de 24h. Corres quando quiseres (não é diário).
+- **`triage.py`** — agente de diagnóstico (Gemini), corre logo a seguir ao check no
+  mesmo workflow; no-op sem issues critical ou sem `GEMINI_API_KEY` (secção 6).
+- **`analyze_history.py`** — análise de 90 dias: agendada semanalmente (segunda 07:00
+  UTC) e corrida on-demand quando quiseres.
+- **`onboard_client.py`** — onboarding de cliente novo: valida acessos e escreve uma
+  proposta de config na aba `config_proposta` (workflow manual, secção 9).
 
 ---
 
@@ -99,6 +103,7 @@ Há **dois programas independentes**:
 | `baseline_threshold_pct` | `40` | *(Opcional)* Limiar do WARN em % da mediana do dia-da-semana (vazio = 50). Aceita `40`, `40%` ou `0.4` |
 | `gtm_container_id` | `GTM-ABC123` | *(Opcional)* Container GTM do cliente — basta preencher numa linha do cliente |
 | `Nome_Tag_GTM` | `GA4 - Footer Contact` | *(Opcional, **preenchida pelo script**, não à mão)* Que tag GTM dispara este evento — puramente informativa |
+| `GTM_Event_Params` | `value={{DLV - price}}, currency=EUR` | *(Opcional, **preenchida pelo script**)* Event parameters configurados na tag GTM — puramente informativa |
 
 > As colunas opcionais podem nem existir na Sheet — o código tolera a ausência
 > (só exige as colunas que existirem na primeira linha). A `Nome_Tag_GTM` é a única
@@ -124,10 +129,11 @@ Recriada a cada corrida (histórico limpo, sem acumular). Uma linha por (evento,
 | `checked_at` | `2026-06-26 08:00 UTC` | Quando correu |
 | `client_id`, `platform`, `event_name` | | Identificação |
 | `severity` | `critical` | Copiado da config |
+| `check` | `count` / `value` | Se a linha verifica a **contagem** ou o **valor monetário** do evento (secção 5-ter) |
 | `window` | `10d`, `24h`, `48h` | **Que janela** produziu esta linha (ver secção 5) |
-| `count` | `5` | Eventos/conversões nessa janela |
+| `count` | `5` | Eventos/conversões nessa janela (nas linhas `value`, é a soma do valor) |
 | `expected` | `45.0` | Mediana do dia-da-semana usada como baseline (vazio nas linhas sem check relativo) |
-| `status` | `OK` / `WARN` / `FAIL` | `FAIL` se `count == 0`; `WARN` se `count` < limiar × `expected` |
+| `status` | `OK` / `WARN` / `FAIL` | `FAIL` se `count == 0` (ou valor a zero com contagem > 0); `WARN` se `count` < limiar × `expected` |
 
 > Um evento verificado na janela curta (por baseline automática ou por flag) produz
 > **duas** linhas: uma da janela larga (`10d`) e outra da janela curta (`24h`/`48h`).
@@ -148,6 +154,8 @@ Recriada a cada corrida. Ajuda-te a preencher a coluna `24hBackGA4_48hBackGAds`:
 | `avg_per_day` | Volume médio diário nos 90 dias |
 | `median_per_day` | Mediana diária nos 90 dias (robusta a picos de campanha) |
 | `weekday_medians` | Mediana por dia-da-semana (`Seg 12 · Ter 14 · …`) — para calibrar o `baseline_threshold_pct` |
+| `pct_days_with_value` | Dos dias em que o evento disparou, em quantos % trouxe valor > 0 |
+| `value_carrying` | `sim` se o evento entra no check automático de valor (secção 5-ter) |
 | `suggestion_24h` | `sim` se disparou em ≥80% dos dias, senão `não` |
 
 **Workflow de uso:** corres `analyze_history.py` → vês as sugestões → copias `sim`/`não`
@@ -236,6 +244,32 @@ corrida (é reescrito, não preservado).
 acesso ao container, ou container inexistente → aviso no log e a análise completa na
 mesma. O check diário (`main.py`) não usa o scope GTM de todo.
 
+**Event parameters (`GTM_Event_Params`):** o mesmo passo extrai os parâmetros
+configurados em cada tag (nome + expressão, ex.: `value={{DLV - price}}, currency=EUR`),
+incluindo os que vivem numa variável partilhada "Google Tag: Event Settings". Atenção à
+semântica: isto mostra o que a tag está **configurada para enviar** — não prova que o
+valor chega às plataformas. Quem prova é o check de valor (secção seguinte).
+
+---
+
+## 5-ter. Check de valor (o incidente do Revenue)
+
+Para eventos que **comprovadamente carregam valor monetário**, o check diário verifica
+também o valor, não só a contagem — `count > 0` com `value == 0` é o cenário exato do
+incidente que motivou este projeto (conversões registadas, valor perdido no caminho).
+
+- **Dados:** obtidos no mesmo fetch diário de 90 dias (métrica `eventValue` no GA4,
+  `metrics.all_conversions_value` no GAds) — zero chamadas extra.
+- **Elegibilidade automática** (`is_value_carrying` em [src/baseline.py](src/baseline.py)):
+  valor > 0 em ≥80% dos dias em que o evento disparou, com pelo menos 10 dias de
+  evidência nos 90. Um cliente lead-gen sem valores não gera nenhuma linha de valor.
+- **Lógica binária, sem baseline:** FAIL quando há contagem mas o valor é zero (na
+  janela larga e no dia estável da janela curta). Sem WARN — por construção não há
+  falsos positivos.
+- Na aba `results`, estas linhas têm `check = value` e a coluna `count` mostra a soma
+  do valor. A `history_analysis` mostra o critério (`pct_days_with_value`,
+  `value_carrying`).
+
 ---
 
 ## 6. Lógica de alertas
@@ -251,6 +285,26 @@ No Slack, a mensagem **etiqueta a janela e o tipo** para a equipa perceber a urg
 - 🔴 `FAIL` na janela curta (`24h`/`48h`) = "partiu ontem" — urgente
 - 🟠 `FAIL` na janela larga (`10d`) = "não dispara há X dias"
 - 🟡 `WARN` = "ainda dispara, mas muito abaixo do normal" (mostra count vs. mediana e % abaixo)
+- 💰 `FAIL` de valor = "eventos registados mas SEM valor" (contagem OK, valor a zero)
+
+### Triagem automática (agente Gemini — opcional)
+
+Depois do alerta determinístico, o [triage.py](triage.py) corre como segundo passo do
+workflow diário e, **só quando há issues critical**, cruza cada falha com o contexto GTM
+(a tag ainda existe na versão live? está pausada? que versões do container existem?) e o
+histórico recente, pede um diagnóstico curto ao Gemini e publica uma 2ª mensagem Slack
+"🤖 Diagnóstico automático".
+
+Desenho fail-safe, por camadas:
+1. Sem o secret `GEMINI_API_KEY` → no-op silencioso (mesmo padrão do Slack webhook).
+   É assim que a funcionalidade fica "adormecida" até ser ativada.
+2. Sem issues critical → no-op.
+3. Qualquer erro (API Gemini, GTM, rede) → impresso e engolido, exit 0. **O alerta
+   determinístico já saiu antes** — o agente só pode acrescentar informação, nunca
+   bloqueá-la ou substituí-la.
+
+Modelo default `gemini-2.5-flash` (barato, free tier); override pela variável
+`GEMINI_MODEL` do repositório.
 
 Ver [src/slack.py](src/slack.py).
 
@@ -262,15 +316,18 @@ Ver [src/slack.py](src/slack.py).
 |---|---|
 | [main.py](main.py) | Orquestrador do check diário. Lê config, corre checks (janelas + baseline), escreve results, alerta. |
 | [src/baseline.py](src/baseline.py) | Helpers puros (sem APIs): janelas, mediana por dia-da-semana, decisão OK/WARN/FAIL, parsing do threshold. Testável com dados sintéticos. |
-| [src/ga4.py](src/ga4.py) | Acesso à GA4 Data API. `fetch_daily_event_counts` (breakdown diário, base de tudo) + `fetch_event_counts` (janela agregada, legado). |
-| [src/gads.py](src/gads.py) | Acesso à Google Ads API. `fetch_daily_conversion_counts` + `fetch_conversion_labels` (labels p/ matching GTM) + `fetch_conversion_counts` (legado). |
+| [src/ga4.py](src/ga4.py) | Acesso à GA4 Data API. `fetch_daily_event_data` (contagens + valores diários, base de tudo) + wrappers legados. |
+| [src/gads.py](src/gads.py) | Acesso à Google Ads API. `fetch_daily_conversion_data` (contagens + valores) + `fetch_conversion_labels` (labels p/ matching GTM) + wrappers legados. |
 | [src/gtm.py](src/gtm.py) | Acesso à Tag Manager API (versão live) + matching determinístico evento↔tag. Helpers puros testáveis sem APIs. |
 | [src/sheets.py](src/sheets.py) | Leitura da config e escrita das abas `results` / `history_analysis` / `daily_history`. Define os schemas (headers). |
-| [src/slack.py](src/slack.py) | Formata e envia o alerta Slack via Incoming Webhook (🔴/🟠 FAIL, 🟡 WARN). |
-| [analyze_history.py](analyze_history.py) | Análise de 90 dias on-demand → sugestões de 24h, medianas p/ calibração, aba `daily_history` e preenchimento da `Nome_Tag_GTM`. |
+| [src/slack.py](src/slack.py) | Formata e envia o alerta Slack via Incoming Webhook (🔴/🟠 FAIL, 🟡 WARN, 💰 valor). |
+| [analyze_history.py](analyze_history.py) | Análise de 90 dias (semanal + on-demand) → sugestões de 24h, medianas, aba `daily_history` e colunas GTM da config. |
+| [onboard_client.py](onboard_client.py) | Onboarding: valida acessos do cliente novo e escreve a proposta na aba `config_proposta`. |
+| [triage.py](triage.py) | Agente de diagnóstico (Gemini) das falhas critical → 2ª mensagem Slack. Gated pelo secret `GEMINI_API_KEY`. |
 | [setup_oauth.py](setup_oauth.py) | Fluxo OAuth local, uma vez. Gera os 3 valores p/ GitHub Secrets. |
-| [.github/workflows/daily_check.yml](.github/workflows/daily_check.yml) | Cron diário (08:00 UTC) + trigger manual. |
-| [.github/workflows/analyze_history.yml](.github/workflows/analyze_history.yml) | Trigger manual da análise de 90 dias. |
+| [.github/workflows/daily_check.yml](.github/workflows/daily_check.yml) | Cron diário (08:00 UTC) + trigger manual. Passos: check → triagem. |
+| [.github/workflows/analyze_history.yml](.github/workflows/analyze_history.yml) | Análise de 90 dias: cron semanal (seg 07:00 UTC) + trigger manual. |
+| [.github/workflows/onboard_client.yml](.github/workflows/onboard_client.yml) | Onboarding manual com 4 inputs (client_id, GA4, GAds, GTM). |
 
 ---
 
@@ -290,28 +347,33 @@ Ver [src/slack.py](src/slack.py).
 - **Segredos** (nunca no código — só em GitHub Secrets):
   `GOOGLE_CLIENT_ID`, `GOOGLE_CLIENT_SECRET`, `GOOGLE_REFRESH_TOKEN`,
   `GOOGLE_ADS_DEVELOPER_TOKEN`, `GOOGLE_ADS_LOGIN_CUSTOMER_ID`,
-  `GOOGLE_SHEET_ID`, `SLACK_WEBHOOK_URL`.
+  `GOOGLE_SHEET_ID`, `SLACK_WEBHOOK_URL`, e opcionalmente `GEMINI_API_KEY`
+  (ativa a triagem automática; chave criada em aistudio.google.com).
 - `client_secret.json` está no `.gitignore` e nunca é commitado.
 
 ---
 
 ## 9. Como adicionar um novo cliente
 
-Não há código a mudar. Só a Sheet:
+Não há código a mudar. O caminho recomendado é o **workflow de onboarding**:
 
-1. Na aba `config`, adiciona uma linha por cada (plataforma, evento) do cliente novo:
-   - `client_id` novo, `account_id` (property GA4 ou customer ID GAds), `platform`,
-     `event_name`, `severity`, `goback_days`.
-2. Garante que a tua conta Google (via MCC) tem acesso à conta GAds e à property GA4 do
-   cliente. (Para GAds, têm de estar sob a MCC da Karma.)
-3. (Opcional) Corre o workflow **90-Day History Analysis** → vê a aba `history_analysis`
-   → preenche `24hBackGA4_48hBackGAds=sim` nos eventos de disparo diário que queres vigiar a 24h.
-4. Pronto. O próximo check diário já inclui o cliente novo.
+1. **Acessos (único passo verdadeiramente manual):** garante que a tua conta Google tem
+   leitura na property GA4, na conta GAds (sob a MCC da Karma) e no container GTM do
+   cliente.
+2. No GitHub: **Actions → Onboard New Client → Run workflow**, preenchendo `client_id`,
+   GA4 property ID e/ou GAds customer ID, e (opcional) o GTM container ID. O workflow
+   **valida cada acesso** com mensagens claras e falha cedo se algo faltar.
+3. Revê a aba **`config_proposta`**: uma linha por evento descoberto, com sugestão do
+   flag de 24h (só para eventos abaixo do floor da baseline), medianas, `value_carrying`
+   e as colunas GTM. Tudo vem como `secondary` — **promove a `critical` os eventos que
+   importam** (é a única decisão de negócio que fica contigo).
+4. Copia as linhas revistas (colunas da config) para a aba `config`. O próximo check
+   diário já inclui o cliente novo.
 
 > **Eventos importantes diferem por cliente.** O Westlake é lead-gen puro (conversões de
-> *Submit lead form*, só conta `> 0`). Um cliente de e-commerce teria eventos de receita —
-> o schema suporta isso, mas a verificação de *valor* (não só contagem) ainda não está
-> implementada; é o próximo passo natural quando aparecer um cliente assim.
+> *Submit lead form*, só conta `> 0`). Num cliente de e-commerce, os eventos com valor
+> consistente entram automaticamente no check de valor (secção 5-ter) — a coluna
+> `value_carrying` da proposta mostra logo quais.
 
 ---
 
@@ -328,9 +390,16 @@ Não há código a mudar. Só a Sheet:
 - ✅ **Mapeamento GTM** (jul 2026): coluna informativa `Nome_Tag_GTM` preenchida pelo
   analyze_history via Tag Manager API — matching determinístico, sem LLM (a ideia
   original de um workflow com LLM foi descartada: o join por `eventName`/label é exato).
+- ✅ **Verificação de valor/revenue** (jul 2026): check binário `count>0 && value==0`,
+  elegibilidade automática pelo histórico (secção 5-ter) + coluna `GTM_Event_Params`
+  com o inventário de parâmetros configurados por tag.
+- ✅ **Onboarding + cron** (jul 2026): workflow `Onboard New Client` com validação de
+  acessos e proposta na aba `config_proposta`; analyze_history agendado à segunda.
+- ✅ **Triagem agentic** (jul 2026): `triage.py` com Gemini (`gemini-2.5-flash`),
+  gated pelo secret `GEMINI_API_KEY` — decisão de custo: Gemini (free tier) em vez da
+  API Anthropic. O alerta determinístico nunca depende do agente.
 - ⏸️ **Meta Ads** — discutido, adiável. O modelo Sheet-driven já comporta uma `platform`
   nova; faltaria um `src/meta.py` análogo e o ramo respetivo em `main.py`.
-- ⏸️ **Verificação de valor/revenue** (não só contagem) — para clientes de e-commerce.
 - ⏸️ **Renomeação de eventos** — considerada (jun 2026) e adiada: os nomes atuais são
   autoexplicativos. Se um dia avançar, atenção à descontinuidade de série no GA4.
 

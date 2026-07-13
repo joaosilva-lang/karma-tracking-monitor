@@ -14,6 +14,11 @@ def _window_phrase(window: str) -> str:
 
 def _format_line(f: dict) -> str:
     prefix = f"`{f['client_id']}` | {f['platform']} | `{f['event_name']}`"
+    if f.get("check") == "value":
+        return (
+            f"💰 {prefix} — eventos registados *SEM valor* "
+            f"{_window_phrase(f['window'])} (contagem OK, valor a zero)"
+        )
     if f["status"] == "WARN" and f.get("expected"):
         expected = f["expected"]
         pct_below = round((1 - f["count"] / expected) * 100)

@@ -107,6 +107,7 @@ The script prints 3 values: `GOOGLE_CLIENT_ID`, `GOOGLE_CLIENT_SECRET`, `GOOGLE_
    | `GOOGLE_ADS_DEVELOPER_TOKEN` | from Step 2 |
    | `GOOGLE_SHEET_ID` | from Step 4 |
    | `SLACK_WEBHOOK_URL` | from your Slack app |
+   | `GEMINI_API_KEY` *(optional)* | from [aistudio.google.com](https://aistudio.google.com) — enables the automatic triage agent (a Gemini-written diagnosis posted to Slack after critical alerts). Without it the triage step is a silent no-op. |
 
 ---
 
@@ -129,13 +130,13 @@ Check the Sheet for a new `results` tab and your Slack channel for any critical 
 
 ## Adding a New Client
 
-No code changes — everything lives in the Sheet. See "Como adicionar um novo cliente"
+No code changes. Use the onboarding workflow — see "Como adicionar um novo cliente"
 in [ARCHITECTURE.md](ARCHITECTURE.md) for the full walkthrough. In short:
 
-1. Add one row per (platform, event) to the `config` tab, with the client's
-   `client_id` and `account_id` (GA4 property ID or GAds customer ID); optionally
-   fill `gtm_container_id` (e.g. `GTM-ABC123`) to enable the GTM tag mapping
-2. Ensure your Google account has access to the client's GA4 property, GAds account
+1. Ensure your Google account has access to the client's GA4 property, GAds account
    (under the Karma MCC) and GTM container
-3. (Optional) Run the **90-Day History Analysis** workflow to get 24h-check
-   suggestions and baseline calibration data for the new client's events
+2. Run **Actions → Onboard New Client** with the client's IDs — it validates each
+   access and writes a proposed config (with stats and suggestions per discovered
+   event) to the `config_proposta` tab
+3. Review the proposal (promote the events that matter to `critical`) and copy the
+   rows into the `config` tab

@@ -1,3 +1,4 @@
+import json
 import os
 from datetime import date, timedelta
 
@@ -6,13 +7,15 @@ from google.oauth2.credentials import Credentials
 from src.baseline import (
     BASELINE_DAYS,
     BASELINE_MIN_MEDIAN,
+    date_range,
+    is_value_carrying,
     parse_threshold,
     short_check_status,
     weekday_median,
     window_count,
 )
-from src.ga4 import fetch_daily_event_counts
-from src.gads import fetch_daily_conversion_counts, get_gads_client
+from src.ga4 import fetch_daily_event_data
+from src.gads import fetch_daily_conversion_data, get_gads_client
 from src.sheets import get_sheets_client, read_config, write_results, DEFAULT_GOBACK_DAYS
 from src.slack import send_alert
 
@@ -29,6 +32,11 @@ STABLE_DAY_OFFSET = {"GA4": 1, "GADS": 2}
 WINDOW_24H_LABEL = {"GA4": "24h", "GADS": "48h"}
 
 TRUTHY = {"sim", "yes", "true", "1", "y", "s"}
+
+# Written when critical issues exist, consumed by triage.py (which is a no-op
+# unless GEMINI_API_KEY is configured).
+TRIAGE_INPUT_FILE = "triage_input.json"
+TRIAGE_HISTORY_DAYS = 30
 
 
 def build_credentials() -> Credentials:
@@ -82,23 +90,28 @@ def get_24h_events(config_rows: list[dict], client_id: str, platform: str) -> se
 
 
 def _fetch_daily(account_id: str, platform: str, credentials: Credentials,
-                 gads_client=None) -> dict[str, dict[str, float]]:
+                 gads_client=None) -> tuple[dict, dict]:
+    """Returns (counts, values) maps: {event: {date: n}} over BASELINE_DAYS."""
     if platform == "GA4":
-        return fetch_daily_event_counts(account_id, credentials, days=BASELINE_DAYS)
-    return fetch_daily_conversion_counts(account_id, gads_client, days=BASELINE_DAYS)
+        return fetch_daily_event_data(account_id, credentials, days=BASELINE_DAYS)
+    return fetch_daily_conversion_data(account_id, gads_client, days=BASELINE_DAYS)
 
 
 def _row(client_id: str, platform: str, event_name: str, severity: str,
-         window: str, count: float, status: str, expected: float = None) -> dict:
+         window: str, count: float, status: str, expected: float = None,
+         check: str = "count", history: dict = None) -> dict:
     return {
         "client_id": client_id,
         "platform": platform,
         "event_name": event_name,
+        "check": check,
         "severity": severity,
         "window": window,
-        "count": int(round(count)),
+        "count": round(count, 2) if check == "value" else int(round(count)),
         "status": status,
         "expected": round(expected, 1) if expected is not None else "",
+        # Not written to the Sheet — carried along for triage context.
+        "history": history or {},
     }
 
 
@@ -111,7 +124,9 @@ def _check_platform(client_id: str, platform: str, display_name: str, account_id
     baseline are all computed locally from the same {event: {date: count}}
     matrix — one API call per (client, platform).
     """
-    daily = _fetch_daily(account_id, platform, credentials, gads_client=gads_client)
+    daily_counts, daily_values = _fetch_daily(
+        account_id, platform, credentials, gads_client=gads_client
+    )
 
     configured = {
         row["event_name"] for row in config_rows
@@ -119,16 +134,22 @@ def _check_platform(client_id: str, platform: str, display_name: str, account_id
     }
     # Union with configured events so a fully dead event still produces a FAIL
     # row instead of silently vanishing from the API response.
-    all_events = sorted(set(daily) | configured)
+    all_events = sorted(set(daily_counts) | configured)
 
     yesterday = date.today() - timedelta(days=1)
     test_day = date.today() - timedelta(days=STABLE_DAY_OFFSET[platform])
     flagged = get_24h_events(config_rows, client_id, platform)
+    all_dates = date_range(yesterday, BASELINE_DAYS)
+
+    def recent(day_map: dict) -> dict:
+        return {d: day_map[d] for d in date_range(yesterday, TRIAGE_HISTORY_DAYS) if d in day_map}
 
     results = []
     for event_name in all_events:
         cfg = get_event_config(config_rows, client_id, platform, event_name)
-        day_map = daily.get(event_name, {})
+        day_map = daily_counts.get(event_name, {})
+        value_map = daily_values.get(event_name, {})
+        history = recent(day_map)
 
         # --- Wide goback-window check (one row per event) ---
         goback_days = min(cfg["goback_days"], BASELINE_DAYS)
@@ -136,6 +157,7 @@ def _check_platform(client_id: str, platform: str, display_name: str, account_id
         results.append(_row(
             client_id, display_name, event_name, cfg["severity"],
             f"{goback_days}d", wide_count, "OK" if wide_count > 0 else "FAIL",
+            history=history,
         ))
 
         # --- Short check: automatic baseline above the volume floor, plain
@@ -147,12 +169,35 @@ def _check_platform(client_id: str, platform: str, display_name: str, account_id
             results.append(_row(
                 client_id, display_name, event_name, cfg["severity"],
                 WINDOW_24H_LABEL[platform], count, status, expected=expected,
+                history=history,
             ))
         elif event_name in flagged:
             count = window_count(day_map, yesterday, STABLE_DAY_OFFSET[platform])
             results.append(_row(
                 client_id, display_name, event_name, cfg["severity"],
                 WINDOW_24H_LABEL[platform], count, "OK" if count > 0 else "FAIL",
+                history=history,
+            ))
+
+        # --- Value check: only for events whose history proves they carry
+        # value. Binary (count>0 but value==0), no baseline — zero false
+        # positives by construction. This is the original Revenue incident. ---
+        if is_value_carrying(day_map, value_map, all_dates):
+            value_history = recent(value_map)
+            wide_value = window_count(value_map, yesterday, goback_days)
+            results.append(_row(
+                client_id, display_name, event_name, cfg["severity"],
+                f"{goback_days}d", wide_value,
+                "FAIL" if wide_count > 0 and wide_value == 0 else "OK",
+                check="value", history=value_history,
+            ))
+            day_count = day_map.get(test_day.isoformat(), 0)
+            day_value = value_map.get(test_day.isoformat(), 0)
+            results.append(_row(
+                client_id, display_name, event_name, cfg["severity"],
+                WINDOW_24H_LABEL[platform], day_value,
+                "FAIL" if day_count > 0 and day_value == 0 else "OK",
+                check="value", history=value_history,
             ))
 
     return results
@@ -211,6 +256,27 @@ def main() -> None:
         print(f"WARNING: {len(critical_issues)} critical issue(s) found but no Slack webhook configured.")
     else:
         print("All checks passed.")
+
+    if critical_issues:
+        write_triage_input(critical_issues, config_rows)
+
+
+def write_triage_input(critical_issues: list[dict], config_rows: list[dict]) -> None:
+    """Dumps critical issues (+ per-client GTM container) for triage.py."""
+    containers = {}
+    for row in config_rows:
+        container_id = str(row.get("gtm_container_id", "")).strip()
+        if container_id and row["client_id"] not in containers:
+            containers[row["client_id"]] = container_id
+
+    payload = {
+        "generated_at_day": date.today().isoformat(),
+        "gtm_containers": containers,
+        "issues": critical_issues,
+    }
+    with open(TRIAGE_INPUT_FILE, "w") as fh:
+        json.dump(payload, fh, ensure_ascii=False, indent=1)
+    print(f"Wrote {TRIAGE_INPUT_FILE} for triage ({len(critical_issues)} issue(s)).")
 
 
 if __name__ == "__main__":

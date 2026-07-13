@@ -81,14 +81,18 @@ def resolve_container(service, public_id: str) -> str | None:
             return None
 
 
-def fetch_live_tags(service, container_path: str) -> list[dict]:
-    """Returns the tags of the container's published (live) version."""
+def fetch_live_container(service, container_path: str) -> tuple[list[dict], list[dict]]:
+    """Returns (tags, variables) of the container's published (live) version.
+
+    Variables are needed to resolve shared "Google Tag: Event Settings"
+    (`gtes`) variables that GA4 tags may reference instead of inline params.
+    """
     version = (
         service.accounts().containers().versions()
         .live(parent=container_path)
         .execute()
     )
-    return version.get("tag", [])
+    return version.get("tag", []), version.get("variable", [])
 
 
 def _param(tag: dict, key: str) -> str:
@@ -129,6 +133,85 @@ def build_event_tag_map(tags: list[dict]) -> tuple[dict, list]:
                 mapping.setdefault(("GADS", label), []).append(display)
 
     return mapping, dynamic
+
+
+# The GA4 event-parameter table appears under either of these keys depending
+# on container age; map entries use "parameter"/"parameterValue" (current) or
+# "name"/"value" (older exports). Handle all combinations defensively.
+_EVENT_PARAM_LIST_KEYS = ("eventSettingsTable", "eventParameters")
+
+# GTM variable type of the shared "Google Tag: Event Settings" variable.
+TYPE_EVENT_SETTINGS_VAR = "gtes"
+
+NO_PARAMS = "(sem params)"
+
+
+def _map_entry(entry: dict) -> tuple[str, str] | None:
+    kv = {p.get("key"): p.get("value", "") or "" for p in entry.get("map", [])}
+    name = kv.get("parameter") or kv.get("name") or ""
+    value = kv.get("parameterValue") or kv.get("value") or ""
+    return (name, value) if name else None
+
+
+def _extract_event_params(entity: dict) -> list[tuple[str, str]]:
+    """Event parameter (name, value_expr) pairs of a gaawe tag or gtes variable."""
+    pairs = []
+    for p in entity.get("parameter", []):
+        if p.get("key") in _EVENT_PARAM_LIST_KEYS and p.get("type") == "list":
+            for entry in p.get("list", []):
+                pair = _map_entry(entry)
+                if pair:
+                    pairs.append(pair)
+    return pairs
+
+
+def build_event_param_map(tags: list[dict], variables: list[dict]) -> dict[tuple[str, str], str]:
+    """Pure join: which parameters is each event configured to send?
+
+    Returns {("GA4", event_name) | ("GADS", conversion_label): "a={{X}}, b=EUR"}.
+    GA4 tags referencing a shared Event Settings variable get its params merged
+    with the inline ones. Events whose tag sends no params map to NO_PARAMS.
+    """
+    settings_vars = {
+        v.get("name"): _extract_event_params(v)
+        for v in variables
+        if v.get("type") == TYPE_EVENT_SETTINGS_VAR
+    }
+
+    pairs_by_key: dict[tuple[str, str], list[tuple[str, str]]] = {}
+    for tag in tags:
+        tag_type = tag.get("type")
+        if tag_type == TYPE_GA4_EVENT:
+            event_name = _param(tag, "eventName").strip()
+            if not event_name or "{{" in event_name:
+                continue
+            pairs = _extract_event_params(tag)
+            settings_ref = _param(tag, "eventSettingsVariable").strip()
+            if settings_ref.startswith("{{") and settings_ref.endswith("}}"):
+                pairs = pairs + settings_vars.get(settings_ref[2:-2].strip(), [])
+            key = ("GA4", event_name)
+        elif tag_type == TYPE_GADS_CONVERSION:
+            label = _param(tag, "conversionLabel").strip()
+            if not label:
+                continue
+            pairs = [
+                (name, value)
+                for name in ("conversionValue", "currencyCode")
+                if (value := _param(tag, name).strip())
+            ]
+            key = ("GADS", label)
+        else:
+            continue
+
+        merged = pairs_by_key.setdefault(key, [])
+        for pair in pairs:
+            if pair not in merged:
+                merged.append(pair)
+
+    return {
+        key: ", ".join(f"{name}={value}" for name, value in pairs) if pairs else NO_PARAMS
+        for key, pairs in pairs_by_key.items()
+    }
 
 
 def extract_conversion_label(snippet: str) -> str | None:

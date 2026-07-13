@@ -12,6 +12,12 @@ BASELINE_DAYS = 90
 BASELINE_MIN_MEDIAN = 10
 BASELINE_THRESHOLD_DEFAULT = 0.5
 
+# Value checks only apply to events whose history proves they carry value:
+# value>0 on >= VALUE_CARRYING_PCT of the days they fired, with at least
+# MIN_VALUE_DAYS fired days of evidence.
+MIN_VALUE_DAYS = 10
+VALUE_CARRYING_PCT = 0.80
+
 
 def normalize_date(value: str) -> str:
     """GA4 returns dates as YYYYMMDD, GAds as YYYY-MM-DD. Normalize to ISO."""
@@ -64,6 +70,25 @@ def parse_threshold(raw, default: float = BASELINE_THRESHOLD_DEFAULT) -> float:
     except ValueError:
         return default
     return value / 100 if value > 1 else value
+
+
+def pct_days_with_value(counts_map: dict[str, float], values_map: dict[str, float],
+                        dates: list[str]) -> tuple[int, float]:
+    """Returns (fired_days, pct): on the days the event fired within `dates`,
+    the fraction of them that also carried value > 0."""
+    fired_days = [d for d in dates if counts_map.get(d, 0) > 0]
+    if not fired_days:
+        return 0, 0.0
+    with_value = sum(1 for d in fired_days if values_map.get(d, 0) > 0)
+    return len(fired_days), with_value / len(fired_days)
+
+
+def is_value_carrying(counts_map: dict[str, float], values_map: dict[str, float],
+                      dates: list[str]) -> bool:
+    """True when history proves the event consistently carries value, so a
+    day with count>0 and value==0 is genuinely anomalous."""
+    fired_days, pct = pct_days_with_value(counts_map, values_map, dates)
+    return fired_days >= MIN_VALUE_DAYS and pct >= VALUE_CARRYING_PCT
 
 
 def short_check_status(count: float, expected: float, threshold: float) -> str:

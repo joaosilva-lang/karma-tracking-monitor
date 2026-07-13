@@ -6,33 +6,45 @@ CONFIG_TAB = "config"
 RESULTS_TAB = "results"
 HISTORY_TAB = "history_analysis"
 DAILY_TAB = "daily_history"
+PROPOSAL_TAB = "config_proposta"
 
 # Optional columns: baseline_threshold_pct is the WARN threshold for the
 # relative check as a % of the weekday median (empty -> 50%);
-# gtm_container_id (GTM-XXXXXX, one non-empty value per client is enough) and
-# Nome_Tag_GTM (filled by the analyze_history GTM step, never by hand) drive
-# the informational event->GTM-tag mapping.
+# gtm_container_id (GTM-XXXXXX, one non-empty value per client is enough),
+# Nome_Tag_GTM and GTM_Event_Params (both filled by the analyze_history GTM
+# step, never by hand) drive the informational event->GTM mapping.
 CONFIG_HEADERS = [
     "client_id", "account_id", "platform", "event_name",
     "severity", "goback_days", "24hBackGA4_48hBackGAds", "baseline_threshold_pct",
-    "gtm_container_id", "Nome_Tag_GTM",
+    "gtm_container_id", "Nome_Tag_GTM", "GTM_Event_Params",
 ]
 GTM_TAG_COLUMN = "Nome_Tag_GTM"
+GTM_PARAMS_COLUMN = "GTM_Event_Params"
+
+# Onboarding proposal: the config columns first (so reviewed rows can be
+# copy-pasted straight into config) followed by informational stats.
+PROPOSAL_HEADERS = CONFIG_HEADERS + [
+    "median_per_day", "pct_days", "pct_days_with_value",
+    "value_carrying", "weekday_medians",
+]
 DEFAULT_GOBACK_DAYS = 7
 
 # `window` distinguishes the short 24h-style check ("24h"/"48h") from the
-# wider goback window ("10d", etc). `count` is the event/conversion count in
-# that window. `expected` is the weekday-median baseline the count was
-# compared against (empty for rows without a relative check).
+# wider goback window ("10d", etc). `check` is "count" (event/conversion
+# counting) or "value" (monetary value carried by the event — for value rows
+# the `count` column holds the value sum). `expected` is the weekday-median
+# baseline the count was compared against (empty for rows without a relative
+# check).
 RESULTS_HEADERS = [
-    "checked_at", "client_id", "platform", "event_name",
+    "checked_at", "client_id", "platform", "event_name", "check",
     "severity", "window", "count", "expected", "status",
 ]
 
 HISTORY_HEADERS = [
     "analyzed_at", "client_id", "platform", "event_name",
     "days_fired_of_90", "pct_days", "avg_per_day",
-    "median_per_day", "weekday_medians", "suggestion_24h",
+    "median_per_day", "weekday_medians",
+    "pct_days_with_value", "value_carrying", "suggestion_24h",
 ]
 
 
@@ -58,22 +70,19 @@ def read_config(sheet_id: str, client: gspread.Client) -> list[dict]:
     return [r for r in records if r.get("client_id") and r.get("event_name")]
 
 
-def update_config_gtm_tags(sheet_id: str, client: gspread.Client,
-                           values_by_key: dict[tuple[str, str, str], str]) -> int:
-    """Surgically fills the Nome_Tag_GTM column of the config tab.
+def update_config_columns(sheet_id: str, client: gspread.Client,
+                          values_by_key: dict[tuple[str, str, str], dict[str, str]]) -> int:
+    """Surgically fills script-owned columns of the config tab.
 
-    values_by_key: {(client_id, PLATFORM_UPPER, event_name): cell_value}.
-    Only cells in that one column are touched — rows are matched in place,
-    never created, and no other column is written. Returns how many cells
-    were updated; 0 if the column doesn't exist in the Sheet yet.
+    values_by_key: {(client_id, PLATFORM_UPPER, event_name): {column: value}}.
+    Only the named columns are touched (and only those present in the Sheet
+    header) — rows are matched in place, never created, and nothing else is
+    written. Returns how many cells were updated.
     """
     sh = client.open_by_key(sheet_id)
     ws = sh.worksheet(CONFIG_TAB)
 
     header = ws.row_values(1)
-    if GTM_TAG_COLUMN not in header:
-        return 0
-    tag_col = header.index(GTM_TAG_COLUMN) + 1  # 1-based
 
     def col_index(name: str) -> int | None:
         return header.index(name) if name in header else None
@@ -88,8 +97,10 @@ def update_config_gtm_tags(sheet_id: str, client: gspread.Client,
             return row[idx].strip() if idx < len(row) else ""
 
         key = (cell(ci), cell(pi).upper(), cell(ei))
-        if key in values_by_key:
-            updates.append(gspread.Cell(row_number, tag_col, values_by_key[key]))
+        for column, value in values_by_key.get(key, {}).items():
+            target = col_index(column)
+            if target is not None:
+                updates.append(gspread.Cell(row_number, target + 1, value))
 
     if updates:
         ws.update_cells(updates, value_input_option="RAW")
@@ -114,6 +125,7 @@ def write_results(sheet_id: str, client: gspread.Client, rows: list[dict]) -> No
             row["client_id"],
             row["platform"],
             row["event_name"],
+            row.get("check", "count"),
             row["severity"],
             row["window"],
             row["count"],
@@ -146,8 +158,34 @@ def write_history_analysis(sheet_id: str, client: gspread.Client, rows: list[dic
             row["avg_per_day"],
             row["median_per_day"],
             row["weekday_medians"],
+            row["pct_days_with_value"],
+            row["value_carrying"],
             row["suggestion_24h"],
         ])
+    ws.update(table, value_input_option="RAW")
+
+
+def write_config_proposal(sheet_id: str, client: gspread.Client, rows: list[dict]) -> None:
+    """Recreates the config_proposta tab with the onboarding proposal.
+
+    Never touches the real config tab — the human reviews severities here and
+    copy-pastes the config columns into config.
+    """
+    sh = client.open_by_key(sheet_id)
+    try:
+        ws = sh.worksheet(PROPOSAL_TAB)
+        sh.del_worksheet(ws)
+    except gspread.exceptions.WorksheetNotFound:
+        pass
+    ws = sh.add_worksheet(
+        title=PROPOSAL_TAB,
+        rows=max(200, len(rows) + 10),
+        cols=len(PROPOSAL_HEADERS) + 2,
+    )
+
+    table = [PROPOSAL_HEADERS]
+    for row in rows:
+        table.append([row.get(header, "") for header in PROPOSAL_HEADERS])
     ws.update(table, value_input_option="RAW")
 
 

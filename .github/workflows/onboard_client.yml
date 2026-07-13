@@ -1,0 +1,51 @@
+name: Onboard New Client
+
+on:
+  workflow_dispatch:
+    inputs:
+      client_id:
+        description: "Identificador do cliente (ex.: acme)"
+        required: true
+      ga4_property_id:
+        description: "GA4 property ID (opcional se houver GAds)"
+        required: false
+        default: ""
+      gads_customer_id:
+        description: "Google Ads customer ID (opcional se houver GA4)"
+        required: false
+        default: ""
+      gtm_container_id:
+        description: "GTM container ID, ex. GTM-ABC123 (opcional)"
+        required: false
+        default: ""
+
+jobs:
+  onboard:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: "pip"
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Run onboarding
+        env:
+          ONBOARD_CLIENT_ID: ${{ inputs.client_id }}
+          ONBOARD_GA4_PROPERTY: ${{ inputs.ga4_property_id }}
+          ONBOARD_GADS_CUSTOMER: ${{ inputs.gads_customer_id }}
+          ONBOARD_GTM_CONTAINER: ${{ inputs.gtm_container_id }}
+          GOOGLE_CLIENT_ID: ${{ secrets.GOOGLE_CLIENT_ID }}
+          GOOGLE_CLIENT_SECRET: ${{ secrets.GOOGLE_CLIENT_SECRET }}
+          GOOGLE_REFRESH_TOKEN: ${{ secrets.GOOGLE_REFRESH_TOKEN }}
+          GOOGLE_ADS_DEVELOPER_TOKEN: ${{ secrets.GOOGLE_ADS_DEVELOPER_TOKEN }}
+          GOOGLE_ADS_LOGIN_CUSTOMER_ID: ${{ secrets.GOOGLE_ADS_LOGIN_CUSTOMER_ID }}
+          GOOGLE_SHEET_ID: ${{ secrets.GOOGLE_SHEET_ID }}
+        run: python onboard_client.py

@@ -1,7 +1,11 @@
 name: 90-Day History Analysis
 
 on:
-  workflow_dispatch: # manual trigger only — run when you want to refresh 24h suggestions
+  schedule:
+    # Weekly on Monday 07:00 UTC — an hour before the daily check, so
+    # suggestions, medians and the GTM mapping never go stale.
+    - cron: "0 7 * * 1"
+  workflow_dispatch: # manual trigger — run anytime to refresh on demand
 
 jobs:
   analyze:

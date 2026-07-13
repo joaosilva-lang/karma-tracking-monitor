@@ -21,12 +21,15 @@ CONFIG_HEADERS = [
 GTM_TAG_COLUMN = "Nome_Tag_GTM"
 GTM_PARAMS_COLUMN = "GTM_Event_Params"
 
-# Onboarding proposal: the config columns first (so reviewed rows can be
-# copy-pasted straight into config) followed by informational stats.
-PROPOSAL_HEADERS = CONFIG_HEADERS + [
+# Onboarding proposal: the config columns first (in the LIVE config tab's own
+# order, resolved at write time — see write_config_proposal) so reviewed rows
+# copy-paste straight into config, followed by these informational stats.
+STAT_HEADERS = [
     "median_per_day", "pct_days", "pct_days_with_value",
     "value_carrying", "weekday_medians",
 ]
+# Fallback header order used only when the config tab doesn't exist yet.
+PROPOSAL_HEADERS = CONFIG_HEADERS + STAT_HEADERS
 DEFAULT_GOBACK_DAYS = 7
 
 # `window` distinguishes the short 24h-style check ("24h"/"48h") from the
@@ -168,10 +171,26 @@ def write_history_analysis(sheet_id: str, client: gspread.Client, rows: list[dic
 def write_config_proposal(sheet_id: str, client: gspread.Client, rows: list[dict]) -> None:
     """Recreates the config_proposta tab with the onboarding proposal.
 
-    Never touches the real config tab — the human reviews severities here and
-    copy-pastes the config columns into config.
+    The config columns are laid out in the LIVE config tab's own header order
+    (read here at write time), so reviewed rows copy-paste straight into config
+    without column misalignment — whatever order the user keeps config in. The
+    informational stats (STAT_HEADERS) always follow to the right; pasting a
+    whole row is safe because those extra columns land under no config header
+    and read_config ignores them. Never touches the real config tab.
     """
     sh = client.open_by_key(sheet_id)
+
+    # Mirror config's current column order; fall back to the canonical order
+    # only if config doesn't exist yet or is empty.
+    try:
+        config_header = sh.worksheet(CONFIG_TAB).row_values(1)
+    except gspread.exceptions.WorksheetNotFound:
+        config_header = []
+    if not config_header:
+        config_header = list(CONFIG_HEADERS)
+
+    headers = config_header + STAT_HEADERS
+
     try:
         ws = sh.worksheet(PROPOSAL_TAB)
         sh.del_worksheet(ws)
@@ -180,12 +199,12 @@ def write_config_proposal(sheet_id: str, client: gspread.Client, rows: list[dict
     ws = sh.add_worksheet(
         title=PROPOSAL_TAB,
         rows=max(200, len(rows) + 10),
-        cols=len(PROPOSAL_HEADERS) + 2,
+        cols=len(headers) + 2,
     )
 
-    table = [PROPOSAL_HEADERS]
+    table = [headers]
     for row in rows:
-        table.append([row.get(header, "") for header in PROPOSAL_HEADERS])
+        table.append([row.get(header, "") for header in headers])
     ws.update(table, value_input_option="RAW")
 
 

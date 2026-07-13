@@ -106,8 +106,10 @@ def build_event_tag_map(tags: list[dict]) -> tuple[dict, list]:
     """Pure join over GTM tags.
 
     Returns (mapping, dynamic):
-    - mapping: {("GA4", event_name) | ("GADS", conversion_label): [tag names]}.
-      Paused tags are included but annotated "<name> (pausada)".
+    - mapping: {("GA4", event_name) | ("GADS", conversion_label): [tag names]},
+      in container order. Paused tags are EXCLUDED — they don't fire, so they
+      don't belong in the config's tag columns (the triage agent still surfaces
+      paused tags via its separate paused_tags list).
     - dynamic: [(tag_name, event_name_expr)] for GA4 tags whose event name uses
       GTM variables ({{...}}) — those can't be matched deterministically.
     """
@@ -115,8 +117,9 @@ def build_event_tag_map(tags: list[dict]) -> tuple[dict, list]:
     dynamic: list[tuple[str, str]] = []
 
     for tag in tags:
+        if tag.get("paused"):
+            continue
         name = tag.get("name", "")
-        display = f"{name} (pausada)" if tag.get("paused") else name
 
         tag_type = tag.get("type")
         if tag_type == TYPE_GA4_EVENT:
@@ -126,11 +129,11 @@ def build_event_tag_map(tags: list[dict]) -> tuple[dict, list]:
             if "{{" in event_name:
                 dynamic.append((name, event_name))
                 continue
-            mapping.setdefault(("GA4", event_name), []).append(display)
+            mapping.setdefault(("GA4", event_name), []).append(name)
         elif tag_type == TYPE_GADS_CONVERSION:
             label = _param(tag, "conversionLabel").strip()
             if label:
-                mapping.setdefault(("GADS", label), []).append(display)
+                mapping.setdefault(("GADS", label), []).append(name)
 
     return mapping, dynamic
 
@@ -165,12 +168,15 @@ def _extract_event_params(entity: dict) -> list[tuple[str, str]]:
     return pairs
 
 
-def build_event_param_map(tags: list[dict], variables: list[dict]) -> dict[tuple[str, str], str]:
-    """Pure join: which parameters is each event configured to send?
+def build_event_param_map(tags: list[dict], variables: list[dict]) -> dict[tuple[tuple[str, str], str], str]:
+    """Pure join: which parameters is each tag configured to send?
 
-    Returns {("GA4", event_name) | ("GADS", conversion_label): "a={{X}}, b=EUR"}.
-    GA4 tags referencing a shared Event Settings variable get its params merged
-    with the inline ones. Events whose tag sends no params map to NO_PARAMS.
+    Returns {(("GA4", event_name) | ("GADS", conversion_label), tag_name):
+    "a={{X}}, b=EUR"} — keyed PER TAG (each config row carries exactly one
+    tag, so each row shows its own tag's params). Paused tags are excluded,
+    same as build_event_tag_map. GA4 tags referencing a shared Event Settings
+    variable get its params merged with the inline ones. Tags sending no
+    params map to NO_PARAMS.
     """
     settings_vars = {
         v.get("name"): _extract_event_params(v)
@@ -178,8 +184,10 @@ def build_event_param_map(tags: list[dict], variables: list[dict]) -> dict[tuple
         if v.get("type") == TYPE_EVENT_SETTINGS_VAR
     }
 
-    pairs_by_key: dict[tuple[str, str], list[tuple[str, str]]] = {}
+    params_by_tag: dict[tuple[tuple[str, str], str], str] = {}
     for tag in tags:
+        if tag.get("paused"):
+            continue
         tag_type = tag.get("type")
         if tag_type == TYPE_GA4_EVENT:
             event_name = _param(tag, "eventName").strip()
@@ -188,7 +196,9 @@ def build_event_param_map(tags: list[dict], variables: list[dict]) -> dict[tuple
             pairs = _extract_event_params(tag)
             settings_ref = _param(tag, "eventSettingsVariable").strip()
             if settings_ref.startswith("{{") and settings_ref.endswith("}}"):
-                pairs = pairs + settings_vars.get(settings_ref[2:-2].strip(), [])
+                for pair in settings_vars.get(settings_ref[2:-2].strip(), []):
+                    if pair not in pairs:
+                        pairs.append(pair)
             key = ("GA4", event_name)
         elif tag_type == TYPE_GADS_CONVERSION:
             label = _param(tag, "conversionLabel").strip()
@@ -203,15 +213,11 @@ def build_event_param_map(tags: list[dict], variables: list[dict]) -> dict[tuple
         else:
             continue
 
-        merged = pairs_by_key.setdefault(key, [])
-        for pair in pairs:
-            if pair not in merged:
-                merged.append(pair)
+        params_by_tag[(key, tag.get("name", ""))] = (
+            ", ".join(f"{name}={value}" for name, value in pairs) if pairs else NO_PARAMS
+        )
 
-    return {
-        key: ", ".join(f"{name}={value}" for name, value in pairs) if pairs else NO_PARAMS
-        for key, pairs in pairs_by_key.items()
-    }
+    return params_by_tag
 
 
 def extract_conversion_label(snippet: str) -> str | None:

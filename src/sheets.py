@@ -20,6 +20,10 @@ CONFIG_HEADERS = [
 ]
 GTM_TAG_COLUMN = "Nome_Tag_GTM"
 GTM_PARAMS_COLUMN = "GTM_Event_Params"
+# Written into surplus duplicate config rows when an event has fewer active
+# tags than rows (e.g. a tag was paused after the rows were created). Rows are
+# never deleted — the marker tells the human which duplicates to clean up.
+NO_ACTIVE_TAG = "(sem tag ativa correspondente)"
 
 # Onboarding proposal: the config columns first (in the LIVE config tab's own
 # order, resolved at write time — see write_config_proposal) so reviewed rows
@@ -75,41 +79,107 @@ def read_config(sheet_id: str, client: gspread.Client) -> list[dict]:
     return [r for r in records if r.get("client_id") and r.get("event_name")]
 
 
-def update_config_columns(sheet_id: str, client: gspread.Client,
-                          values_by_key: dict[tuple[str, str, str], dict[str, str]]) -> int:
-    """Surgically fills script-owned columns of the config tab.
+def plan_config_gtm_updates(header: list[str], data_rows: list[list[str]],
+                            values_by_key: dict[tuple[str, str, str], list[dict[str, str]]],
+                            ) -> tuple[list[tuple[int, int, str]], list[tuple[int, list[str]]]]:
+    """Pure planner for update_config_columns (testable without gspread).
 
-    values_by_key: {(client_id, PLATFORM_UPPER, event_name): {column: value}}.
-    Only the named columns are touched (and only those present in the Sheet
-    header) — rows are matched in place, never created, and nothing else is
-    written. Returns how many cells were updated.
+    values_by_key: {(client_id, PLATFORM_UPPER, event_name): [{column: value},
+    ...]} — ONE dict per desired row for that event (one tag per row). Rows of
+    the same key are matched in sheet order: entry i -> matching row i.
+    - More entries than rows: extra entries become new rows inserted below the
+      key's last row (a copy of it with the named columns replaced) — the one
+      case where the script creates config rows.
+    - Fewer entries than rows: surplus rows get NO_ACTIVE_TAG in the named
+      columns (never deleted).
+    - Keys with no matching row are skipped: config decides what is monitored.
+
+    Returns (cell_updates, row_insertions):
+    - cell_updates: [(row_number, col_number, value)] — 1-indexed, coordinates
+      valid BEFORE any insertion (apply these first).
+    - row_insertions: [(insert_at_row_number, [row_values, ...])] — apply
+      bottom-up (descending anchor) so earlier anchors don't shift.
     """
-    sh = client.open_by_key(sheet_id)
-    ws = sh.worksheet(CONFIG_TAB)
-
-    header = ws.row_values(1)
-
     def col_index(name: str) -> int | None:
         return header.index(name) if name in header else None
 
     ci, pi, ei = col_index("client_id"), col_index("platform"), col_index("event_name")
     if None in (ci, pi, ei):
-        return 0
+        return [], []
 
-    updates = []
-    for row_number, row in enumerate(ws.get_all_values()[1:], start=2):
+    rows_by_key: dict[tuple[str, str, str], list[int]] = {}
+    for row_number, row in enumerate(data_rows, start=2):
         def cell(idx):
             return row[idx].strip() if idx < len(row) else ""
+        rows_by_key.setdefault((cell(ci), cell(pi).upper(), cell(ei)), []).append(row_number)
 
-        key = (cell(ci), cell(pi).upper(), cell(ei))
-        for column, value in values_by_key.get(key, {}).items():
-            target = col_index(column)
-            if target is not None:
-                updates.append(gspread.Cell(row_number, target + 1, value))
+    cell_updates: list[tuple[int, int, str]] = []
+    row_insertions: list[tuple[int, list[str]]] = []
 
-    if updates:
-        ws.update_cells(updates, value_input_option="RAW")
-    return len(updates)
+    for key, entries in values_by_key.items():
+        row_numbers = rows_by_key.get(key, [])
+        if not row_numbers or not entries:
+            continue
+        writable_columns = {c for entry in entries for c in entry if col_index(c) is not None}
+
+        # entry i -> row i
+        for row_number, entry in zip(row_numbers, entries):
+            for column in writable_columns:
+                cell_updates.append(
+                    (row_number, col_index(column) + 1, entry.get(column, "")))
+
+        # more tags than rows -> insert copies of the last row below it
+        if len(entries) > len(row_numbers):
+            anchor = row_numbers[-1]
+            template = list(data_rows[anchor - 2])
+            template += [""] * (len(header) - len(template))
+            block = []
+            for entry in entries[len(row_numbers):]:
+                new_row = list(template)
+                for column in writable_columns:
+                    new_row[col_index(column)] = entry.get(column, "")
+                block.append(new_row)
+            row_insertions.append((anchor + 1, block))
+
+        # more rows than tags -> mark the surplus, never delete
+        for row_number in row_numbers[len(entries):]:
+            for column in writable_columns:
+                cell_updates.append((row_number, col_index(column) + 1, NO_ACTIVE_TAG))
+
+    return cell_updates, row_insertions
+
+
+def update_config_columns(sheet_id: str, client: gspread.Client,
+                          values_by_key: dict[tuple[str, str, str], list[dict[str, str]]]) -> int:
+    """Fills script-owned columns of the config tab, one tag per row.
+
+    See plan_config_gtm_updates for the matching semantics. Only the named
+    columns are touched (and only those present in the Sheet header); the only
+    structural change ever made is inserting duplicate rows when an event has
+    more active GTM tags than config rows. Returns cells updated + rows added.
+    """
+    sh = client.open_by_key(sheet_id)
+    ws = sh.worksheet(CONFIG_TAB)
+
+    all_values = ws.get_all_values()
+    if not all_values:
+        return 0
+    header, data_rows = all_values[0], all_values[1:]
+
+    cell_updates, row_insertions = plan_config_gtm_updates(header, data_rows, values_by_key)
+
+    if cell_updates:
+        ws.update_cells(
+            [gspread.Cell(r, c, v) for r, c, v in cell_updates],
+            value_input_option="RAW",
+        )
+    # Bottom-up so lower anchors aren't shifted by earlier insertions.
+    inserted = 0
+    for anchor, block in sorted(row_insertions, reverse=True):
+        ws.insert_rows(block, row=anchor, value_input_option="RAW")
+        inserted += len(block)
+
+    return len(cell_updates) + inserted
 
 
 def write_results(sheet_id: str, client: gspread.Client, rows: list[dict]) -> None:

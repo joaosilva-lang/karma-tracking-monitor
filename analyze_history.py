@@ -162,7 +162,7 @@ def map_gtm_tags(config_rows: list[dict], sheet_id: str, sheets_client) -> None:
         print(f"GTM mapping skipped (could not build GTM client): {exc}")
         return
 
-    values_by_key: dict[tuple[str, str, str], dict[str, str]] = {}
+    values_by_key: dict[tuple[str, str, str], list[dict[str, str]]] = {}
 
     for client_id, public_id in containers.items():
         maps = build_gtm_maps_for_client(service, public_id, client_id)
@@ -197,10 +197,18 @@ def map_gtm_tags(config_rows: list[dict], sheet_id: str, sheets_client) -> None:
             else:
                 continue
             tag_names = tag_map.get(lookup_key, []) if lookup_key else []
-            values_by_key[(client_id, platform, event_name)] = {
-                GTM_TAG_COLUMN: format_tag_names(tag_names),
-                GTM_PARAMS_COLUMN: (param_map.get(lookup_key, "") if lookup_key else "") if tag_names else "",
-            }
+            if tag_names:
+                # One entry per active tag — update_config_columns puts each
+                # on its own config row (inserting duplicates when needed).
+                values_by_key[(client_id, platform, event_name)] = [
+                    {GTM_TAG_COLUMN: tag,
+                     GTM_PARAMS_COLUMN: param_map.get((lookup_key, tag), "")}
+                    for tag in tag_names
+                ]
+            else:
+                values_by_key[(client_id, platform, event_name)] = [
+                    {GTM_TAG_COLUMN: format_tag_names([]), GTM_PARAMS_COLUMN: ""}
+                ]
 
     if values_by_key:
         try:

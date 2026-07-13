@@ -257,9 +257,21 @@ O matching é **determinístico via Tag Manager API** (nada de LLM/inferência):
   dos `tag_snippets` de cada conversion action (`fetch_conversion_labels` em
   [src/gads.py](src/gads.py)) → join exato por label.
 
-Convenções na célula: múltiplas tags → `Tag A + Tag B`; tag pausada → `Nome (pausada)`;
-sem correspondência → `(sem tag GTM)`. O valor reflete o estado do container a cada
-corrida (é reescrito, não preservado).
+Convenções (jul 2026 — **uma tag por linha**):
+- **Tags pausadas são excluídas** de `Nome_Tag_GTM` e `GTM_Event_Params` — não disparam,
+  não pertencem à config. (O agente de triagem continua a ver as pausadas pela sua
+  lista própria — uma tag pausada é um diagnóstico valioso quando um evento morre.)
+- **Uma tag ativa por linha.** Evento com 2+ tags ativas → o script **insere linhas
+  duplicadas** na config por baixo da existente (copia severity/goback/etc., muda só as
+  células GTM) — a única exceção à regra "a estrutura da config é humana". Duplicados do
+  mesmo evento não afetam os checks (o universo de eventos é um set).
+- Mais linhas duplicadas que tags ativas (ex.: uma tag foi pausada entretanto) → as
+  excedentes são marcadas `(sem tag ativa correspondente)`, nunca apagadas.
+- Sem correspondência ativa → `(sem tag GTM)`. O valor reflete o estado do container a
+  cada corrida (é reescrito, não preservado).
+- `build_client_accounts` avisa no log quando linhas duplicadas do mesmo cliente+
+  plataforma têm `account_id`s diferentes (quase de certeza um typo — a última linha é
+  a que decide a conta consultada).
 
 **Falha graciosa:** o passo GTM está isolado em try/except — sem scope no token, sem
 acesso ao container, ou container inexistente → aviso no log e a análise completa na

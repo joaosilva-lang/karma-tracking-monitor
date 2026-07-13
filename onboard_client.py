@@ -119,29 +119,32 @@ def main() -> None:
             below_floor = stats["median_per_day"] < FLAG_SUGGESTION_MAX_MEDIAN
             flag = "sim" if stats["suggestion_24h"] == "sim" and below_floor else ""
 
-            proposal.append({
-                "client_id": client_id,
-                "account_id": account_id,
-                "platform": display,
-                "event_name": event_name,
-                "severity": "secondary",
-                # Pre-filled from the gap analysis (longest dry spell x1.5),
-                # so reviewed rows are copy-paste-ready; adjust before copying
-                # if you disagree.
-                "goback_days": stats["goback_days_sugerido"],
-                "24hBackGA4_48hBackGAds": flag,
-                "baseline_threshold_pct": "",
-                "gtm_container_id": gtm_container,
-                "Nome_Tag_GTM": format_tag_names(tag_names) if gtm_ok else "",
-                "GTM_Event_Params": (param_map.get(lookup_key, "") if lookup_key and tag_names else ""),
-                "median_per_day": stats["median_per_day"],
-                "pct_days": stats["pct_days"],
-                "pct_days_with_value": stats["pct_days_with_value"],
-                "value_carrying": stats["value_carrying"],
-                "max_gap_days": stats["max_gap_days"],
-                "goback_days_sugerido": stats["goback_days_sugerido"],
-                "weekday_medians": stats["weekday_medians"],
-            })
+            # One proposal row PER active tag (stats repeated) — mirrors the
+            # one-tag-per-row layout of config. No tags -> a single row.
+            for tag in (tag_names or [None]):
+                proposal.append({
+                    "client_id": client_id,
+                    "account_id": account_id,
+                    "platform": display,
+                    "event_name": event_name,
+                    "severity": "secondary",
+                    # Pre-filled from the gap analysis (longest dry spell
+                    # x1.5), so reviewed rows are copy-paste-ready; adjust
+                    # before copying if you disagree.
+                    "goback_days": stats["goback_days_sugerido"],
+                    "24hBackGA4_48hBackGAds": flag,
+                    "baseline_threshold_pct": "",
+                    "gtm_container_id": gtm_container,
+                    "Nome_Tag_GTM": (tag or format_tag_names([])) if gtm_ok else "",
+                    "GTM_Event_Params": (param_map.get((lookup_key, tag), "") if tag else ""),
+                    "median_per_day": stats["median_per_day"],
+                    "pct_days": stats["pct_days"],
+                    "pct_days_with_value": stats["pct_days_with_value"],
+                    "value_carrying": stats["value_carrying"],
+                    "max_gap_days": stats["max_gap_days"],
+                    "goback_days_sugerido": stats["goback_days_sugerido"],
+                    "weekday_medians": stats["weekday_medians"],
+                })
 
     sheets_client = get_sheets_client(credentials)
     write_config_proposal(sheet_id, sheets_client, proposal)

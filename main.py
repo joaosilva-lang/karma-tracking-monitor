@@ -51,13 +51,22 @@ def build_credentials() -> Credentials:
 
 
 def build_client_accounts(config_rows: list[dict]) -> dict:
-    """Returns {client_id: {platform: account_id}} derived from Sheet config rows."""
+    """Returns {client_id: {platform: account_id}} derived from Sheet config rows.
+
+    The last row wins per (client, platform) — so differing account_ids for
+    the same pair are almost certainly a typo in a duplicated row, and would
+    silently point the checks at the wrong account. Warn loudly.
+    """
     accounts: dict[str, dict[str, str]] = {}
     for row in config_rows:
         client_id = row["client_id"]
         platform = row["platform"].upper()
         account_id = str(row["account_id"])
-        accounts.setdefault(client_id, {})[platform] = account_id
+        previous = accounts.setdefault(client_id, {}).get(platform)
+        if previous is not None and previous != account_id:
+            print(f"⚠️ config: '{client_id}' {platform} tem account_ids diferentes "
+                  f"({previous} vs {account_id}) — a usar {account_id}. Corrige a config.")
+        accounts[client_id][platform] = account_id
     return accounts
 
 

@@ -19,7 +19,13 @@ from src.baseline import (
 )
 from src.ga4 import fetch_daily_event_data
 from src.gads import fetch_daily_conversion_data, get_gads_client
-from src.sheets import get_sheets_client, read_config, write_results, DEFAULT_GOBACK_DAYS
+from src.sheets import (
+    DEFAULT_GOBACK_DAYS,
+    get_sheets_client,
+    read_config,
+    write_daily_history,
+    write_results,
+)
 from src.slack import send_alert
 
 SCOPES = [
@@ -131,12 +137,16 @@ def _row(client_id: str, platform: str, event_name: str, severity: str,
 
 def _check_platform(client_id: str, platform: str, display_name: str, account_id: str,
                     credentials: Credentials, config_rows: list[dict],
-                    gads_client=None) -> list[dict]:
+                    gads_client=None) -> tuple[list[dict], dict[str, dict]]:
     """Runs all checks for one platform from a single 90-day daily fetch.
 
     The wide goback window, the short 24h/48h check and the weekday-median
     baseline are all computed locally from the same {event: {date: count}}
     matrix — one API call per (client, platform).
+
+    Returns (result_rows, daily_counts). The raw matrix is handed back because
+    it is exactly what daily_history stores: the caller writes it to the Sheet
+    instead of throwing away 90 days of data already paid for.
     """
     daily_counts, daily_values = _fetch_daily(
         account_id, platform, credentials, gads_client=gads_client
@@ -233,15 +243,27 @@ def _check_platform(client_id: str, platform: str, display_name: str, account_id
                 check="value", history=value_history,
             ))
 
-    return results
+    return results, daily_counts
 
 
 def run_checks(client_id: str, platforms: dict[str, str], credentials: Credentials,
-               config_rows: list[dict]) -> list[dict]:
+               config_rows: list[dict]) -> tuple[list[dict], dict[str, dict]]:
+    """Returns (result_rows, daily series keyed 'client|Platform|event').
+
+    The series key matches the one analyze_history.py builds, so both jobs
+    write daily_history in the same shape and either can refresh it.
+    """
     results = []
+    series: dict[str, dict[str, float]] = {}
+
+    def collect(display_name: str, platform_output: tuple[list[dict], dict[str, dict]]) -> None:
+        platform_results, daily_counts = platform_output
+        results.extend(platform_results)
+        for event_name, day_map in daily_counts.items():
+            series[f"{client_id}|{display_name}|{event_name}"] = day_map
 
     if "GA4" in platforms:
-        results.extend(_check_platform(
+        collect("GA4", _check_platform(
             client_id, "GA4", "GA4", platforms["GA4"], credentials, config_rows
         ))
 
@@ -253,12 +275,12 @@ def run_checks(client_id: str, platforms: dict[str, str], credentials: Credentia
             developer_token=os.environ["GOOGLE_ADS_DEVELOPER_TOKEN"],
             login_customer_id=os.environ["GOOGLE_ADS_LOGIN_CUSTOMER_ID"],
         )
-        results.extend(_check_platform(
+        collect("GAds", _check_platform(
             client_id, "GADS", "GAds", platforms["GADS"], credentials, config_rows,
             gads_client=gads_client
         ))
 
-    return results
+    return results, series
 
 
 def main() -> None:
@@ -271,9 +293,12 @@ def main() -> None:
     client_accounts = build_client_accounts(config_rows)
 
     all_results = []
+    all_series: dict[str, dict[str, float]] = {}
     for client_id, platforms in client_accounts.items():
         print(f"Checking {client_id}...")
-        all_results.extend(run_checks(client_id, platforms, credentials, config_rows))
+        results, series = run_checks(client_id, platforms, credentials, config_rows)
+        all_results.extend(results)
+        all_series.update(series)
 
     write_results(sheet_id, sheets_client, all_results)
 
@@ -292,6 +317,19 @@ def main() -> None:
 
     if critical_issues:
         write_triage_input(critical_issues, config_rows)
+
+    # Last, and fail-safe. The 90-day matrix is already in memory (the checks ran
+    # off it), so this is a write, not a fetch — it keeps daily_history fresh
+    # every day instead of only on Mondays, which is what the dashboard reads.
+    # It feeds a view, never an alert: a transient Sheets error here must not
+    # turn a delivered alert into a red job, nor skip the triage step (which the
+    # workflow only runs on success). Same fail-safe stance as the triage agent.
+    try:
+        dates = date_range(date.today() - timedelta(days=1), BASELINE_DAYS)
+        write_daily_history(sheet_id, sheets_client, dates, all_series)
+        print(f"Wrote daily_history: {len(dates)} days x {len(all_series)} series.")
+    except Exception as error:
+        print(f"WARNING: daily_history not written ({error}). Checks and alerts unaffected.")
 
 
 def write_triage_input(critical_issues: list[dict], config_rows: list[dict]) -> None:

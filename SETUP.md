@@ -128,6 +128,37 @@ Check the Sheet for a new `results` tab and your Slack channel for any critical 
 
 ---
 
+## Dashboard HTML (local)
+
+A visual view of the same data: per client and event, a 90-day line chart and a
+bar chart of the last week, colour-coded with the monitor's own criteria.
+
+```bash
+pip install -r requirements.txt
+python dashboard.py            # add --sheet-id ID if GOOGLE_SHEET_ID isn't set
+```
+
+- Needs `client_secret.json` in the folder — the same file Step 3 used. The first
+  run opens a browser once to grant **read-only** access to your Sheets and caches
+  the token in `token.json`; after that it asks nothing. It never touches the
+  GitHub secrets and can never write to the Sheet.
+- The Sheet id comes from `--sheet-id`, `GOOGLE_SHEET_ID` in your environment, or
+  a local `.env` file.
+- Output: `dashboard-YYYY-MM-DD.html`, opened in your browser automatically
+  (`--no-open` to skip, `--out DIR` to write elsewhere).
+
+**Sharing it with the team:** the file is fully self-contained — no server, no
+internet, no install. Drop it in the Drive folder where the Sheet already lives;
+whoever needs it downloads and opens it. Access control is Drive's, which already
+governs this exact data.
+
+**Never commit it.** `dashboard*.html` and `token.json` are in `.gitignore` — this
+repo is public and the page contains client names and volumes. The date is in the
+filename on purpose: a stale snapshot in a shared folder is how people reach wrong
+conclusions.
+
+---
+
 ## Adding a New Client
 
 No code changes. Use the onboarding workflow — see "Como adicionar um novo cliente"

@@ -4,3 +4,7 @@ client_secret.json
 __pycache__/
 *.pyc
 .DS_Store
+# Local OAuth token cached by dashboard.py.
+token.json
+# Generated dashboards carry client names and volumes — this repo is public.
+dashboard*.html

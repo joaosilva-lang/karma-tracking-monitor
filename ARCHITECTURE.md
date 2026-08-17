@@ -180,12 +180,33 @@ Sem divergências → sem mensagem. Com `GEMINI_API_KEY` configurada, o Gemini a
 LLM, e qualquer falha do Gemini faz cair para a lista determinística plain. Fail-safe
 total: nenhum erro do digest falha o job (padrão do triage).
 
-### Aba `daily_history` — escrita pelo `analyze_history.py`
+### Aba `daily_history` — escrita pelo check diário E pela análise semanal
 
 Matriz de visualização: uma linha por data (últimos 90 dias) e uma coluna por
-(`cliente|plataforma|evento`). É atualizada **in-place** (clear + update, nunca
-apagada e recriada) precisamente para os **gráficos nativos do Google Sheets** que
-criares sobre ela sobreviverem a cada refresh.
+(`cliente|plataforma|evento`).
+
+Desde 2026-08 é refrescada **todos os dias** pelo [main.py](main.py), não só à
+segunda-feira. Não custa nenhuma chamada extra à API: o `_check_platform` já
+descarrega a matriz de 90 dias para calcular as janelas e as medianas — antes
+deitava-a fora no fim. As duas escritas usam **a mesma chave**
+(`cliente|Plataforma|evento`), pelo que qualquer dos jobs pode refrescar a aba.
+
+### Regra: nenhuma aba é apagada
+
+Todas as escritas na Sheet são **in-place** (crescer a grelha se preciso →
+`clear()` → `update()`), via o helper `_replace_tab_contents` em
+[src/sheets.py](src/sheets.py).
+
+Isto não é estilo, é correção. Apagar uma worksheet destrói tudo o que está
+ancorado nela: fórmulas de outras abas passam a apontar para uma folha que
+deixou de existir, e gráficos, formatação condicional e larguras de coluna vão
+atrás. Recriar uma aba com o mesmo nome **não** recupera nada — é uma folha nova
+com um id novo.
+
+Foi exatamente isto que aconteceu: a `config` tem VLOOKUPs para a
+`history_analysis`, e o `del_worksheet` + `add_worksheet` semanal partia-os
+todas as segundas — só recuperavam entrando na célula e carregando Enter à mão.
+Se acrescentares uma função que escreva na Sheet, usa o helper.
 
 ---
 
@@ -365,7 +386,8 @@ Ver [src/slack.py](src/slack.py).
 | [src/ga4.py](src/ga4.py) | Acesso à GA4 Data API. `fetch_daily_event_data` (contagens + valores diários, base de tudo) + wrappers legados. |
 | [src/gads.py](src/gads.py) | Acesso à Google Ads API. `fetch_daily_conversion_data` (contagens + valores) + `fetch_conversion_labels` (labels p/ matching GTM) + wrappers legados. |
 | [src/gtm.py](src/gtm.py) | Acesso à Tag Manager API (versão live) + matching determinístico evento↔tag. Helpers puros testáveis sem APIs. |
-| [src/sheets.py](src/sheets.py) | Leitura da config e escrita das abas `results` / `history_analysis` / `daily_history`. Define os schemas (headers). |
+| [src/sheets.py](src/sheets.py) | Leitura da config e escrita das abas `results` / `history_analysis` / `daily_history` / `config_proposta`, sempre in-place (`_replace_tab_contents`). Define os schemas (headers). |
+| [dashboard.py](dashboard.py) | **Local, nunca em CI.** Gera uma página HTML autónoma a partir da Sheet: por cliente e evento, gráfico de linha dos 90 dias e barras da última semana. Ver §7-bis. |
 | [src/slack.py](src/slack.py) | Formata e envia o alerta Slack via Incoming Webhook (🔴/🟠 FAIL, 🟡 WARN, 💰 valor). |
 | [analyze_history.py](analyze_history.py) | Análise de 90 dias (semanal + on-demand) → sugestões de 24h, medianas, aba `daily_history` e colunas GTM da config. |
 | [onboard_client.py](onboard_client.py) | Onboarding: valida acessos do cliente novo e escreve a proposta na aba `config_proposta`. |
@@ -374,6 +396,63 @@ Ver [src/slack.py](src/slack.py).
 | [.github/workflows/daily_check.yml](.github/workflows/daily_check.yml) | Cron diário (08:00 UTC) + trigger manual. Passos: check → triagem. |
 | [.github/workflows/analyze_history.yml](.github/workflows/analyze_history.yml) | Análise de 90 dias: cron semanal (seg 07:00 UTC) + trigger manual. |
 | [.github/workflows/onboard_client.yml](.github/workflows/onboard_client.yml) | Onboarding manual com 4 inputs (client_id, GA4, GAds, GTM). |
+
+---
+
+## 7-bis. Dashboard HTML ([dashboard.py](dashboard.py))
+
+O Slack só fala de `critical` em FAIL/WARN e a Sheet não se lê de relance. O
+dashboard existe para ver **a forma do histórico**: se um evento está a morrer
+devagar, se caiu e recuperou, se mudou de patamar de volume.
+
+**Corre localmente, nunca em CI.** `python dashboard.py` → lê as abas `config`,
+`results` e `daily_history` → escreve `dashboard-AAAA-MM-DD.html` e abre-o.
+
+Porquê assim:
+
+- **Nada de BigQuery.** São milhares de células. Um projeto GCP novo, custo e uma
+  segunda cópia da verdade resolveriam um problema de escala que não existe.
+- **Nada de GitHub Pages.** Este repo é público; a página tem nomes de clientes e
+  volumes. O ficheiro é gitignored (`dashboard*.html`, `token.json`) e partilhado
+  à mão — largado na pasta do Drive onde a Sheet já vive, herdando as permissões
+  que já governam estes dados.
+- **Ficheiro único, sem rede.** Os gráficos são SVG gerado em Python; não há CDN,
+  biblioteca de charts nem chamadas ao abrir. Abre em qualquer máquina, offline.
+- **Auth própria e read-only.** Scope `spreadsheets.readonly`, consentimento no
+  browser uma vez, token em `token.json`. Não usa nem toca nos secrets do GitHub.
+
+**A página nunca pode contradizer o Slack.** As cores não são critérios novos:
+`weekday_median`, `short_check_status` e `window_count` vêm de
+[src/baseline.py](src/baseline.py), e o threshold e a severidade vêm do
+`get_event_config` do [main.py](main.py) — as mesmas funções que geram os
+alertas. As regras de elegibilidade são espelhadas uma a uma:
+
+- Evento abaixo de `BASELINE_MIN_MEDIAN` e não marcado 24h/48h → **sem veredito
+  diário**, tal como no monitor. As barras ficam neutras em vez de inventarem um
+  vermelho que nenhum alerta enviaria.
+- Evento marcado 24h/48h → o veredito usa a **janela** do `STABLE_DAY_OFFSET`,
+  não o dia isolado. No Google Ads isso são 2 dias, e a janela olha para a
+  frente (um dia é julgado junto com o seguinte) — é exatamente para isso que a
+  janela de 48h existe: uma conversão atribuída um dia atrasada continua a
+  contar. Julgar dia a dia pintava vermelho o caso que o monitor foi feito para
+  perdoar.
+- No Google Ads o dia mais recente sai como *provisório* — sem isto a página
+  dava falso alarme todos os dias.
+- Evento sem linha na `results` (acrescentado à config depois da última corrida,
+  ou cuja recolha falhou) fica **por verificar**, nunca verde.
+
+Uma nota sobre o gráfico dos 90 dias: o `weekday_median` por defeito procura
+amostras até 90 dias atrás, e no início da janela essas amostras não existem —
+`day_map.get()` devolve 0 e elas contariam como zeros reais, desenhando uma
+rampa que sugeria que "naquela altura esperava-se pouco". O lookback é limitado
+às amostras que existem de facto, e só há linha de esperado a partir de 4
+amostras do mesmo dia-da-semana. No último dia o resultado é idêntico ao que o
+`main.py` usa para alertar.
+
+Como o ficheiro circula, a data é tratada como informação crítica: aparece no
+nome do ficheiro e no topo da página, com dois carimbos distintos (última
+verificação vs. último dia de histórico), e o rodapé diz explicitamente que a
+página não é ao vivo.
 
 ---
 

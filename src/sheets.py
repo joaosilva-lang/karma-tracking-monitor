@@ -182,15 +182,46 @@ def update_config_columns(sheet_id: str, client: gspread.Client,
     return len(cell_updates) + inserted
 
 
-def write_results(sheet_id: str, client: gspread.Client, rows: list[dict]) -> None:
-    """Recreates the results tab (clean history) and writes all result rows."""
-    sh = client.open_by_key(sheet_id)
+def _replace_tab_contents(sh: gspread.Spreadsheet, title: str, table: list[list],
+                          min_rows: int = 100, spare_cols: int = 5) -> gspread.Worksheet:
+    """Replaces a tab's whole contents IN PLACE. Never deletes the worksheet.
+
+    Deleting a worksheet destroys everything anchored to it: cross-tab formulas
+    break (they point at a sheet that no longer exists), and charts, conditional
+    formatting and column widths go with it. Recreating a tab with the same name
+    does NOT bring them back — it's a new sheet with a new id.
+
+    That matters here because the config tab carries hand-written VLOOKUPs into
+    history_analysis, so a weekly delete+recreate silently broke them until the
+    cell was re-entered by hand. Every writer in this module therefore grows the
+    grid if needed, clears, and rewrites — the tab itself survives.
+    """
+    needed_cols = max((len(row) for row in table), default=1)
     try:
-        ws = sh.worksheet(RESULTS_TAB)
-        sh.del_worksheet(ws)
+        ws = sh.worksheet(title)
     except gspread.exceptions.WorksheetNotFound:
-        pass
-    ws = sh.add_worksheet(title=RESULTS_TAB, rows=max(1000, len(rows) + 10), cols=10)
+        ws = sh.add_worksheet(
+            title=title,
+            rows=max(min_rows, len(table) + 10),
+            cols=needed_cols + spare_cols,
+        )
+
+    if ws.col_count < needed_cols:
+        ws.add_cols(needed_cols - ws.col_count)
+    if ws.row_count < len(table):
+        ws.add_rows(len(table) - ws.row_count)
+
+    # clear() empties the whole grid, so rows left over from a longer previous
+    # run don't survive as trailing garbage.
+    ws.clear()
+    if table:
+        ws.update(table, value_input_option="RAW")
+    return ws
+
+
+def write_results(sheet_id: str, client: gspread.Client, rows: list[dict]) -> None:
+    """Rewrites the results tab (clean slate each run) with all result rows."""
+    sh = client.open_by_key(sheet_id)
 
     checked_at = datetime.utcnow().strftime("%Y-%m-%d %H:%M UTC")
     table = [RESULTS_HEADERS]
@@ -207,18 +238,15 @@ def write_results(sheet_id: str, client: gspread.Client, rows: list[dict]) -> No
             row.get("expected", ""),
             row["status"],
         ])
-    ws.update(table, value_input_option="RAW")
+    _replace_tab_contents(sh, RESULTS_TAB, table, min_rows=1000)
 
 
 def write_history_analysis(sheet_id: str, client: gspread.Client, rows: list[dict]) -> None:
-    """Recreates the history_analysis tab with 90-day frequency suggestions."""
+    """Rewrites the history_analysis tab with 90-day frequency suggestions.
+
+    Updated in place: the config tab has VLOOKUPs pointing here.
+    """
     sh = client.open_by_key(sheet_id)
-    try:
-        ws = sh.worksheet(HISTORY_TAB)
-        sh.del_worksheet(ws)
-    except gspread.exceptions.WorksheetNotFound:
-        pass
-    ws = sh.add_worksheet(title=HISTORY_TAB, rows=max(500, len(rows) + 10), cols=12)
 
     analyzed_at = datetime.utcnow().strftime("%Y-%m-%d %H:%M UTC")
     table = [HISTORY_HEADERS]
@@ -239,11 +267,11 @@ def write_history_analysis(sheet_id: str, client: gspread.Client, rows: list[dic
             row["goback_days_sugerido"],
             row["suggestion_24h"],
         ])
-    ws.update(table, value_input_option="RAW")
+    _replace_tab_contents(sh, HISTORY_TAB, table, min_rows=500)
 
 
 def write_config_proposal(sheet_id: str, client: gspread.Client, rows: list[dict]) -> None:
-    """Recreates the config_proposta tab with the onboarding proposal.
+    """Rewrites the config_proposta tab with the onboarding proposal.
 
     The config columns are laid out in the LIVE config tab's own header order
     (read here at write time), so reviewed rows copy-paste straight into config
@@ -265,21 +293,10 @@ def write_config_proposal(sheet_id: str, client: gspread.Client, rows: list[dict
 
     headers = config_header + STAT_HEADERS
 
-    try:
-        ws = sh.worksheet(PROPOSAL_TAB)
-        sh.del_worksheet(ws)
-    except gspread.exceptions.WorksheetNotFound:
-        pass
-    ws = sh.add_worksheet(
-        title=PROPOSAL_TAB,
-        rows=max(200, len(rows) + 10),
-        cols=len(headers) + 2,
-    )
-
     table = [headers]
     for row in rows:
         table.append([row.get(header, "") for header in headers])
-    ws.update(table, value_input_option="RAW")
+    _replace_tab_contents(sh, PROPOSAL_TAB, table, min_rows=200)
 
 
 def write_daily_history(sheet_id: str, client: gspread.Client,
@@ -296,17 +313,4 @@ def write_daily_history(sheet_id: str, client: gspread.Client,
     for d in dates:
         table.append([d] + [series[label].get(d, 0) for label in labels])
 
-    try:
-        ws = sh.worksheet(DAILY_TAB)
-    except gspread.exceptions.WorksheetNotFound:
-        ws = sh.add_worksheet(
-            title=DAILY_TAB, rows=len(table) + 10, cols=len(labels) + 5
-        )
-
-    if ws.col_count < len(labels) + 1:
-        ws.add_cols(len(labels) + 1 - ws.col_count)
-    if ws.row_count < len(table):
-        ws.add_rows(len(table) - ws.row_count)
-
-    ws.clear()
-    ws.update(table, value_input_option="RAW")
+    _replace_tab_contents(sh, DAILY_TAB, table, min_rows=len(table) + 10)

@@ -17,8 +17,15 @@ from src.baseline import (
     weekday_median,
     window_count,
 )
-from src.ga4 import fetch_daily_event_data
+from src.ga4 import fetch_daily_event_data, fetch_daily_param_presence
 from src.gads import fetch_daily_conversion_data, get_gads_client
+from src.gtm import (
+    build_event_param_names,
+    build_gtm_credentials,
+    fetch_live_container,
+    get_gtm_service,
+    resolve_container,
+)
 from src.sheets import (
     DEFAULT_GOBACK_DAYS,
     get_sheets_client,
@@ -107,6 +114,100 @@ def get_24h_events(config_rows: list[dict], client_id: str, platform: str) -> se
     return flagged
 
 
+def get_params_check_override(config_rows: list[dict], client_id: str,
+                              platform: str, event_name: str) -> list[str] | None:
+    """Returns the params_check override for an event (comma-separated names,
+    parsed and stripped), or None to use the automatic GTM-derived list. An
+    empty/absent column means None — never "check nothing"."""
+    for row in config_rows:
+        if (row["client_id"] == client_id and row["platform"].upper() == platform.upper()
+                and row["event_name"] == event_name):
+            raw = str(row.get("params_check", "")).strip()
+            return [p.strip() for p in raw.split(",") if p.strip()] if raw else None
+    return None
+
+
+def get_client_gtm_container(config_rows: list[dict], client_id: str) -> str:
+    """Returns the client's gtm_container_id (first non-empty value found)."""
+    for row in config_rows:
+        container_id = str(row.get("gtm_container_id", "")).strip()
+        if row["client_id"] == client_id and container_id:
+            return container_id
+    return ""
+
+
+def fetch_critical_param_presence(client_id: str, account_id: str, config_rows: list[dict],
+                                  credentials: Credentials, gtm_service) -> dict[str, dict[str, dict]]:
+    """Returns {event_name: {param_name: {date: count}}} for every GA4
+    parameter configured (via GTM, or overridden via params_check) on a
+    CRITICAL event of this client — the only events the daily check alerts on,
+    which keeps the API cost of this feature proportional to what Slack cares
+    about. One fetch_daily_param_presence call per distinct param name, scoped
+    to only the events that need it.
+
+    `gtm_service` is built ONCE per run by the caller (main()), not per
+    client: building it involves an OAuth token refresh and a discovery-doc
+    fetch, which would otherwise repeat for every GA4 client, every day. None
+    means the service couldn't be built for this run (missing scope, auth
+    error) — params-check degrades to {} for every client rather than
+    retrying the same failure per client.
+
+    A failure fetching ONE param (rate limit, deadline, ...) only drops that
+    param, not every param of every critical event — mirrors the granularity
+    of the weekly analysis (build_params_analysis_rows), so a transient GA4
+    hiccup can't mask an unrelated param's real FAIL for the whole client-day.
+    """
+    if gtm_service is None:
+        return {}
+
+    critical_events = {
+        row["event_name"] for row in config_rows
+        if row["client_id"] == client_id and row["platform"].upper() == "GA4"
+        and (row.get("severity") or "secondary") == "critical"
+    }
+    if not critical_events:
+        return {}
+
+    container_id = get_client_gtm_container(config_rows, client_id)
+    if not container_id:
+        return {}
+
+    try:
+        container_path = resolve_container(gtm_service, container_id)
+        if not container_path:
+            print(f"params check: container {container_id} não encontrado/acessível "
+                  f"para '{client_id}' — a saltar verificação de parâmetros.")
+            return {}
+        tags, variables = fetch_live_container(gtm_service, container_path)
+    except Exception as exc:
+        print(f"params check: falhou a ler o container GTM de '{client_id}' ({exc}) "
+              "— checks de contagem/valor não são afetados.")
+        return {}
+
+    param_names_by_event = build_event_param_names(tags, variables)
+    events_by_param: dict[str, set] = {}
+    for event_name in critical_events:
+        override = get_params_check_override(config_rows, client_id, "GA4", event_name)
+        names = override if override is not None else param_names_by_event.get(("GA4", event_name), [])
+        for name in names:
+            events_by_param.setdefault(name, set()).add(event_name)
+
+    presence: dict[str, dict[str, dict]] = {}
+    for param, events in events_by_param.items():
+        try:
+            param_presence = fetch_daily_param_presence(
+                account_id, credentials, param, days=BASELINE_DAYS, event_names=sorted(events))
+        except Exception as exc:
+            print(f"params check: falhou a verificar '{param}' para '{client_id}' ({exc}) "
+                  "— outros parâmetros deste cliente não são afetados.")
+            continue
+        if param_presence is None:
+            continue  # not registered/invisible to the API — the weekly analysis reports this, not the daily check
+        for event_name, day_map in param_presence.items():
+            presence.setdefault(event_name, {})[param] = day_map
+    return presence
+
+
 def _fetch_daily(account_id: str, platform: str, credentials: Credentials,
                  gads_client=None) -> tuple[dict, dict]:
     """Returns (counts, values) maps: {event: {date: n}} over BASELINE_DAYS."""
@@ -117,12 +218,14 @@ def _fetch_daily(account_id: str, platform: str, credentials: Credentials,
 
 def _row(client_id: str, platform: str, event_name: str, severity: str,
          window: str, count: float, status: str, expected: float = None,
-         check: str = "count", history: dict = None, dry_days: int = None) -> dict:
+         check: str = "count", history: dict = None, dry_days: int = None,
+         param: str = "") -> dict:
     return {
         "client_id": client_id,
         "platform": platform,
         "event_name": event_name,
         "check": check,
+        "param": param,
         "severity": severity,
         "window": window,
         "count": round(count, 2) if check == "value" else int(round(count)),
@@ -137,7 +240,7 @@ def _row(client_id: str, platform: str, event_name: str, severity: str,
 
 def _check_platform(client_id: str, platform: str, display_name: str, account_id: str,
                     credentials: Credentials, config_rows: list[dict],
-                    gads_client=None) -> tuple[list[dict], dict[str, dict]]:
+                    gads_client=None, gtm_service=None) -> tuple[list[dict], dict[str, dict]]:
     """Runs all checks for one platform from a single 90-day daily fetch.
 
     The wide goback window, the short 24h/48h check and the weekday-median
@@ -164,6 +267,14 @@ def _check_platform(client_id: str, platform: str, display_name: str, account_id
     test_day = date.today() - timedelta(days=STABLE_DAY_OFFSET[platform])
     flagged = get_24h_events(config_rows, client_id, platform)
     all_dates = date_range(yesterday, BASELINE_DAYS)
+
+    # GA4 only, critical events only — see fetch_critical_param_presence.
+    # {} on GADS (no conversion parameters exposed by the API) and whenever
+    # the GTM/GA4 lookup fails; the count/value checks are never affected.
+    param_presence = (
+        fetch_critical_param_presence(client_id, account_id, config_rows, credentials, gtm_service)
+        if platform == "GA4" else {}
+    )
 
     def recent(day_map: dict) -> dict:
         return {d: day_map[d] for d in date_range(yesterday, TRIAGE_HISTORY_DAYS) if d in day_map}
@@ -243,15 +354,47 @@ def _check_platform(client_id: str, platform: str, display_name: str, account_id
                 check="value", history=value_history,
             ))
 
+        # --- Parameter presence check (GA4 only, critical events only): does
+        # the event's configured GA4 parameter actually arrive with a value?
+        # Binary FAIL (no WARN for partial drops) — same spirit as the value
+        # check, zero false positives by construction. Google Ads is never
+        # checked here: its API exposes no conversion parameters at all. ---
+        if cfg["severity"] == "critical":
+            for param, presence_map in param_presence.get(event_name, {}).items():
+                if not is_value_carrying(day_map, presence_map, all_dates):
+                    continue  # history doesn't prove this param is consistently sent
+                wide_presence = window_count(presence_map, yesterday, goback_days)
+                results.append(_row(
+                    client_id, display_name, event_name, cfg["severity"],
+                    f"{goback_days}d", wide_presence,
+                    "FAIL" if wide_count > 0 and wide_presence == 0 else "OK",
+                    expected=wide_count, check="param", param=param,
+                    history=recent(presence_map),
+                ))
+                if expected >= BASELINE_MIN_MEDIAN or event_name in flagged:
+                    day_presence = presence_map.get(test_day.isoformat(), 0)
+                    day_total = day_map.get(test_day.isoformat(), 0)
+                    results.append(_row(
+                        client_id, display_name, event_name, cfg["severity"],
+                        WINDOW_24H_LABEL[platform], day_presence,
+                        "FAIL" if day_total > 0 and day_presence == 0 else "OK",
+                        expected=day_total, check="param", param=param,
+                        history=recent(presence_map),
+                    ))
+
     return results, daily_counts
 
 
 def run_checks(client_id: str, platforms: dict[str, str], credentials: Credentials,
-               config_rows: list[dict]) -> tuple[list[dict], dict[str, dict]]:
+               config_rows: list[dict], gtm_service=None) -> tuple[list[dict], dict[str, dict]]:
     """Returns (result_rows, daily series keyed 'client|Platform|event').
 
     The series key matches the one analyze_history.py builds, so both jobs
     write daily_history in the same shape and either can refresh it.
+
+    `gtm_service` is built once per run by main() and threaded down to the
+    params-check (see fetch_critical_param_presence) — building it involves
+    an OAuth refresh + discovery-doc fetch, which must not repeat per client.
     """
     results = []
     series: dict[str, dict[str, float]] = {}
@@ -264,7 +407,8 @@ def run_checks(client_id: str, platforms: dict[str, str], credentials: Credentia
 
     if "GA4" in platforms:
         collect("GA4", _check_platform(
-            client_id, "GA4", "GA4", platforms["GA4"], credentials, config_rows
+            client_id, "GA4", "GA4", platforms["GA4"], credentials, config_rows,
+            gtm_service=gtm_service,
         ))
 
     if "GADS" in platforms:
@@ -292,11 +436,23 @@ def main() -> None:
     config_rows = read_config(sheet_id, sheets_client)
     client_accounts = build_client_accounts(config_rows)
 
+    # Built ONCE for the whole run, not per client: it involves an OAuth
+    # refresh + a discovery-doc fetch, which would otherwise repeat for every
+    # GA4 client, every day. None (missing tagmanager.readonly scope, auth
+    # error) degrades the params-check to {} everywhere without retrying the
+    # same failure once per client — count/value checks are never affected.
+    try:
+        gtm_service = get_gtm_service(build_gtm_credentials())
+    except Exception as exc:
+        print(f"params check: GTM indisponível para esta corrida ({exc}) "
+              "— verificação de parâmetros desativada, checks de contagem/valor não são afetados.")
+        gtm_service = None
+
     all_results = []
     all_series: dict[str, dict[str, float]] = {}
     for client_id, platforms in client_accounts.items():
         print(f"Checking {client_id}...")
-        results, series = run_checks(client_id, platforms, credentials, config_rows)
+        results, series = run_checks(client_id, platforms, credentials, config_rows, gtm_service)
         all_results.extend(results)
         all_series.update(series)
 

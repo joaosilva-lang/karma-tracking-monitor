@@ -37,10 +37,11 @@ from src.baseline import (
     per_weekday_medians,
     suggest_goback_days,
 )
-from src.ga4 import fetch_daily_event_data
+from src.ga4 import BUILTIN_PARAM_DIMENSIONS, fetch_daily_event_data, fetch_daily_param_presence
 from src.gads import fetch_conversion_labels, fetch_daily_conversion_data, get_gads_client
 from src.gtm import (
     build_event_param_map,
+    build_event_param_names,
     build_event_tag_map,
     build_gtm_credentials,
     fetch_live_container,
@@ -57,8 +58,10 @@ from src.sheets import (
     update_config_columns,
     write_daily_history,
     write_history_analysis,
+    write_params_analysis,
+    write_readme_tab,
 )
-from main import build_credentials, build_client_accounts, TRUTHY
+from main import build_credentials, build_client_accounts, get_params_check_override, TRUTHY
 
 ANALYSIS_DAYS = 90
 # Config goback_days wider than suggested by more than this margin is
@@ -116,9 +119,13 @@ def _make_gads_client():
     )
 
 
-def build_gtm_maps_for_client(service, public_id: str, client_id: str) -> tuple[dict, dict] | None:
-    """Returns (tag_map, param_map) for a client's live container, or None
-    (with a printed reason) when the container can't be read."""
+def build_gtm_maps_for_client(service, public_id: str, client_id: str) -> tuple[dict, dict, list, list] | None:
+    """Returns (tag_map, param_map, tags, variables) for a client's live
+    container, or None (with a printed reason) when the container can't be
+    read. The raw tags/variables are handed back too so callers needing more
+    than the two derived maps (e.g. the params-check, which needs structured
+    parameter NAMES via build_event_param_names) don't re-fetch the container.
+    """
     try:
         container_path = resolve_container(service, public_id)
         if not container_path:
@@ -136,15 +143,123 @@ def build_gtm_maps_for_client(service, public_id: str, client_id: str) -> tuple[
     for tag_name, expr in dynamic:
         print(f"GTM mapping: tag '{tag_name}' has a dynamic event name ({expr}) "
               f"— can't be matched deterministically.")
-    return tag_map, build_event_param_map(tags, variables)
+    return tag_map, build_event_param_map(tags, variables), tags, variables
 
 
-def map_gtm_tags(config_rows: list[dict], sheet_id: str, sheets_client) -> None:
+NOT_REGISTERED = "não registado no GA4 — criar custom dimension"
+NOT_VERIFIABLE_GADS = "não verificável (Google Ads não expõe parâmetros de conversão)"
+
+
+def build_params_analysis_rows(client_id: str, config_rows: list[dict], tags: list[dict],
+                               variables: list[dict], tag_map: dict, labels_by_name: dict,
+                               ga4_series: dict[str, dict], credentials, property_id: str,
+                               dates: list[str]) -> list[dict]:
+    """params_analysis rows for one client: every event with GA4 parameters
+    configured in GTM gets a REAL verification query (full coverage — unlike
+    the daily check, cost here is irrelevant since this runs weekly). GAds
+    events are reported as non-verifiable, never silently skipped: the API
+    genuinely exposes nothing to check, and that's worth saying explicitly
+    rather than leaving a gap the reader can't tell from "nothing configured".
+
+    Which params get checked for an event uses the EXACT SAME resolution as
+    the daily check (params_check override, or the GTM-auto list) — get the
+    param names right here and vigiado_no_diario follows for free. Diverging
+    would make that column lie: an override that narrows an event's daily
+    params would otherwise still claim "sim" for a param daily never queries,
+    and an override-only param (one GTM's static extraction can't see) would
+    never get a row at all despite being checked every day.
+    """
+    param_names = build_event_param_names(tags, variables)
+    rows = []
+
+    # --- GA4: real verification, one API call per distinct parameter name ---
+    events_by_param: dict[str, set] = {}
+    tag_names_by_event: dict[str, str] = {}
+    severity_by_event: dict[str, str] = {}
+    for row in config_rows:
+        if row["client_id"] != client_id or row["platform"].upper() != "GA4":
+            continue
+        event_name = row["event_name"]
+        override = get_params_check_override(config_rows, client_id, "GA4", event_name)
+        names = override if override is not None else param_names.get(("GA4", event_name), [])
+        if not names:
+            continue
+        tag_names_by_event[event_name] = format_tag_names(tag_map.get(("GA4", event_name), []))
+        severity_by_event[event_name] = row.get("severity") or "secondary"
+        for name in names:
+            events_by_param.setdefault(name, set()).add(event_name)
+
+    if events_by_param and property_id:
+        for param, events in events_by_param.items():
+            try:
+                presence = fetch_daily_param_presence(
+                    property_id, credentials, param, days=len(dates), event_names=sorted(events))
+            except Exception as exc:
+                print(f"params_analysis: falha a verificar '{param}' para '{client_id}': {exc}")
+                presence = None
+
+            for event_name in sorted(events):
+                day_map = ga4_series.get(event_name, {})
+                if presence is None:
+                    rows.append({
+                        "client_id": client_id, "platform": "GA4", "event_name": event_name,
+                        "param": param, "tag_gtm": tag_names_by_event.get(event_name, ""),
+                        "estado": NOT_REGISTERED,
+                        "pct_disparos_com_param": "", "dias_com_param_de_90": "",
+                        "vigiado_no_diario": "não",
+                    })
+                    continue
+                param_map = presence.get(event_name, {})
+                _fired_days, pct = pct_days_with_value(day_map, param_map, dates)
+                # pct_days_with_value's count is the EVENT's fired days (the
+                # denominator) — the column here promises days WITH the param
+                # (the numerator), so it's counted directly rather than
+                # reused from that tuple.
+                days_with_param = sum(1 for d in dates if param_map.get(d, 0) > 0)
+                watched = (severity_by_event.get(event_name) == "critical"
+                          and is_value_carrying(day_map, param_map, dates))
+                rows.append({
+                    "client_id": client_id, "platform": "GA4", "event_name": event_name,
+                    "param": param, "tag_gtm": tag_names_by_event.get(event_name, ""),
+                    "estado": "built-in" if param in BUILTIN_PARAM_DIMENSIONS else "verificado",
+                    "pct_disparos_com_param": f"{round(pct * 100)}%",
+                    "dias_com_param_de_90": days_with_param,
+                    "vigiado_no_diario": "sim" if watched else "não",
+                })
+
+    # --- Google Ads: nothing is verifiable, reported for honest visibility ---
+    for row in config_rows:
+        if row["client_id"] != client_id or row["platform"].upper() != "GADS":
+            continue
+        event_name = row["event_name"]
+        label = labels_by_name.get(event_name, "")
+        lookup_key = ("GADS", label) if label else None
+        names = param_names.get(lookup_key, []) if lookup_key else []
+        if not names:
+            continue
+        tag_names = format_tag_names(tag_map.get(lookup_key, []))
+        for name in names:
+            rows.append({
+                "client_id": client_id, "platform": "GAds", "event_name": event_name,
+                "param": name, "tag_gtm": tag_names, "estado": NOT_VERIFIABLE_GADS,
+                "pct_disparos_com_param": "", "dias_com_param_de_90": "",
+                "vigiado_no_diario": "não",
+            })
+
+    return rows
+
+
+def map_gtm_tags(config_rows: list[dict], sheet_id: str, sheets_client,
+                 ga4_series_by_client: dict[str, dict[str, dict]] = None,
+                 credentials=None) -> None:
     """Fills config's Nome_Tag_GTM + GTM_Event_Params columns for clients with
-    a gtm_container_id.
+    a gtm_container_id, and — when ga4_series_by_client/credentials are given
+    — verifies every event's GA4 parameters against the live property and
+    writes the params_analysis tab (full coverage: every event, not just the
+    critical ones the daily check verifies).
 
     Purely informational; every failure here is printed and swallowed so the
-    analysis job never fails because of the GTM step.
+    analysis job never fails because of the GTM/params step.
     """
     containers: dict[str, str] = {}
     for row in config_rows:
@@ -163,12 +278,13 @@ def map_gtm_tags(config_rows: list[dict], sheet_id: str, sheets_client) -> None:
         return
 
     values_by_key: dict[tuple[str, str, str], list[dict[str, str]]] = {}
+    params_rows: list[dict] = []
 
     for client_id, public_id in containers.items():
         maps = build_gtm_maps_for_client(service, public_id, client_id)
         if maps is None:
             continue
-        tag_map, param_map = maps
+        tag_map, param_map, tags, variables = maps
 
         # GAds side needs the conversion label of each conversion action.
         labels_by_name: dict[str, str] = {}
@@ -210,6 +326,21 @@ def map_gtm_tags(config_rows: list[dict], sheet_id: str, sheets_client) -> None:
                     {GTM_TAG_COLUMN: format_tag_names([]), GTM_PARAMS_COLUMN: ""}
                 ]
 
+        if ga4_series_by_client is not None and credentials is not None:
+            ga4_account = next(
+                (str(r["account_id"]) for r in config_rows
+                 if r["client_id"] == client_id and r["platform"].upper() == "GA4"),
+                None,
+            )
+            try:
+                params_rows.extend(build_params_analysis_rows(
+                    client_id, config_rows, tags, variables, tag_map, labels_by_name,
+                    ga4_series_by_client.get(client_id, {}), credentials, ga4_account,
+                    date_range(date.today() - timedelta(days=1), ANALYSIS_DAYS),
+                ))
+            except Exception as exc:
+                print(f"params_analysis: failed for '{client_id}': {exc}")
+
     if values_by_key:
         try:
             updated = update_config_columns(sheet_id, sheets_client, values_by_key)
@@ -221,6 +352,13 @@ def map_gtm_tags(config_rows: list[dict], sheet_id: str, sheets_client) -> None:
         else:
             print(f"GTM mapping: columns {GTM_TAG_COLUMN}/{GTM_PARAMS_COLUMN} not found "
                   "in config — add them to the Sheet header to enable writing.")
+
+    if params_rows:
+        try:
+            write_params_analysis(sheet_id, sheets_client, params_rows)
+            print(f"Wrote {len(params_rows)} rows to params_analysis.")
+        except Exception as exc:
+            print(f"params_analysis: failed writing to Sheet: {exc}")
 
 
 def find_config_divergences(config_rows: list[dict], all_rows: list[dict]) -> list[str]:
@@ -346,8 +484,22 @@ def main() -> None:
     print(f"Wrote {len(all_rows)} rows to history_analysis ({suggested} suggested for 24h).")
     print(f"Wrote daily_history: {len(dates)} days x {len(all_series)} series.")
 
-    map_gtm_tags(config_rows, sheet_id, sheets_client)
+    # GA4 series, reshaped {client_id: {event_name: day_map}} — what the
+    # params-check needs to judge whether a param is consistently sent
+    # (is_value_carrying compares against the event's OWN count history).
+    ga4_series_by_client: dict[str, dict[str, dict]] = {}
+    for label, day_map in all_series.items():
+        series_client_id, platform, event_name = label.split("|", 2)
+        if platform == "GA4":
+            ga4_series_by_client.setdefault(series_client_id, {})[event_name] = day_map
+
+    map_gtm_tags(config_rows, sheet_id, sheets_client, ga4_series_by_client, credentials)
     send_weekly_digest(config_rows, all_rows)
+
+    try:
+        write_readme_tab(sheet_id, sheets_client)
+    except Exception as exc:
+        print(f"_leia-me tab failed (analysis unaffected): {exc}")
 
 
 if __name__ == "__main__":

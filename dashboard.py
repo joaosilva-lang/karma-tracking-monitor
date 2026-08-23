@@ -40,7 +40,7 @@ from src.baseline import (
     weekday_median,
     window_count,
 )
-from src.sheets import CONFIG_TAB, DAILY_TAB, RESULTS_TAB, read_config
+from src.sheets import CONFIG_TAB, DAILY_TAB, PARAMS_TAB, RESULTS_TAB, read_config
 
 # Read-only: this script must never be able to change the Sheet.
 SCOPES = ["https://www.googleapis.com/auth/spreadsheets.readonly"]
@@ -150,12 +150,25 @@ def read_sheet(sheet_id: str, client: gspread.Client) -> dict:
     # (and write headers) if absent — this script must never write.
     tab(CONFIG_TAB, "Daily Tracking Monitor")
 
+    # Optional, unlike the three tabs above: the params-check feature may not
+    # have run yet (dashboard used before the first post-deploy weekly
+    # analysis). Its absence just means no "Parâmetros" section anywhere,
+    # never a crash.
+    try:
+        params_analysis = sh.worksheet(PARAMS_TAB).get_all_records(value_render_option=raw)
+    except gspread.exceptions.WorksheetNotFound:
+        print(f"Aviso: a aba '{PARAMS_TAB}' ainda não existe — a secção "
+              "\"Parâmetros\" não aparece (corre o 90-Day History Analysis "
+              "com o código de verificação de parâmetros).")
+        params_analysis = []
+
     dates, series = parse_daily_history(history_values)
     return {
         "config": read_config(sheet_id, client),
         "results": results,
         "dates": dates,
         "series": series,
+        "params_analysis": params_analysis,
     }
 
 
@@ -273,13 +286,45 @@ def badge_for(row: dict) -> dict:
     return {"label": label, "status": status, "detail": detail}
 
 
-def build_view_model(config_rows: list[dict], results: list[dict],
-                     dates: list[str], series: dict[str, dict[str, float]]) -> dict:
+def build_params_by_event(params_analysis: list[dict]) -> dict[tuple[str, str, str], list[dict]]:
+    """Groups params_analysis rows by (client_id, platform, event_name) — for
+    every platform: GA4 rows carry a real registration check, GAds rows carry
+    an informative "não verificável" state (nothing to check there, but the
+    names are still worth showing).
+
+    "não registado no GA4" sorts first within each event: it's the one state
+    that's actually actionable (create a custom dimension), so it should be
+    the first thing read, not buried after the params that are already fine.
+    """
+    grouped: dict[tuple[str, str, str], list[dict]] = {}
+    for row in params_analysis:
+        key = (str(row.get("client_id", "")).strip(), platform_key(row.get("platform", "")),
+               str(row.get("event_name", "")).strip())
+        grouped.setdefault(key, []).append({
+            "name": str(row.get("param", "")).strip(),
+            "estado": str(row.get("estado", "")).strip(),
+            "tag_gtm": str(row.get("tag_gtm", "")).strip(),
+        })
+    for items in grouped.values():
+        items.sort(key=lambda p: (0 if "não registado" in p["estado"] else 1, p["name"]))
+    return grouped
+
+
+def build_view_model(config_rows: list[dict], results: list[dict], dates: list[str],
+                     series: dict[str, dict[str, float]], params_analysis: list[dict] = None) -> dict:
     """Everything the page needs, computed from the Sheet. No I/O, no rendering."""
     checked_at = ""
     for row in results:
         if row.get("checked_at"):
             checked_at = str(row["checked_at"])
+            break
+
+    params_analysis = params_analysis or []
+    params_by_event = build_params_by_event(params_analysis)
+    params_analyzed_at = ""
+    for row in params_analysis:
+        if row.get("analyzed_at"):
+            params_analyzed_at = str(row["analyzed_at"])
             break
 
     # Group results rows by event.
@@ -390,6 +435,8 @@ def build_view_model(config_rows: list[dict], results: list[dict],
             for i, day in enumerate(week_dates)
         ]
 
+        event_params = params_by_event.get(key, [])
+
         event = {
             "event_name": event_name,
             "severity": severity,
@@ -406,6 +453,7 @@ def build_view_model(config_rows: list[dict], results: list[dict],
             "expecteds": expecteds,
             "day_statuses": day_statuses,
             "week": week,
+            "params": event_params,
         }
 
         client = clients.setdefault(client_id, {"client_id": client_id, "platforms": {},
@@ -438,6 +486,7 @@ def build_view_model(config_rows: list[dict], results: list[dict],
         "dates": dates,
         "history_last_date": dates[-1] if dates else "",
         "history_days": len(dates),
+        "params_analyzed_at": params_analyzed_at,
         "generated_at": datetime.now().strftime("%Y-%m-%d %H:%M"),
         "totals": totals,
         "clients": ordered_clients,
@@ -639,6 +688,12 @@ details.client[open] > summary::before { content: "▾"; }
 .badge.OK { background: #e8f5e9; color: var(--ok); }
 .badge.WARN { background: #fff3e0; color: var(--warn); }
 .badge.FAIL { background: #ffebee; color: var(--fail); }
+.badge.NA { background: #eceff1; color: var(--muted); }
+
+.params { margin-top: 14px; padding-top: 10px; border-top: 1px dashed var(--line); }
+.params h4 { margin: 0 0 8px; font-size: 12px; color: var(--muted); font-weight: 600; }
+.param-row { display: flex; align-items: center; gap: 10px; padding: 3px 0; font-size: 13px; }
+.param-name { font-weight: 600; min-width: 150px; }
 
 .charts { display: flex; gap: 20px; flex-wrap: wrap; align-items: flex-start; }
 .chart-box { flex: 1 1 320px; min-width: 280px; }
@@ -709,6 +764,26 @@ def esc(value) -> str:
     return html.escape(str(value), quote=True)
 
 
+def render_params(params: list[dict]) -> str:
+    """One row per parameter name, tagged with its GA4 registration state —
+    names only, never values. `title=` carries the raw estado + GTM tag as a
+    native tooltip, same pattern as the SVG charts' hover text."""
+    rows = []
+    for p in params:
+        if "não registado" in p["estado"]:
+            status, detail = "WARN", "não registado no GA4 — criar custom dimension"
+        elif "não verificável" in p["estado"]:
+            status, detail = "NA", p["estado"]
+        else:
+            status, detail = "OK", p["estado"]
+        rows.append(
+            f'<div class="param-row" title="{esc(p["estado"])} · tag GTM: {esc(p["tag_gtm"] or "—")}">'
+            f'<span class="param-name">{esc(p["name"])}</span>'
+            f'<span class="badge {status}">{esc(detail)}</span></div>'
+        )
+    return "".join(rows)
+
+
 def render_event(event: dict, dates: list[str]) -> str:
     badges = "".join(
         f'<span class="badge {esc(b["status"])}">{esc(b["label"])} · '
@@ -727,6 +802,14 @@ def render_event(event: dict, dates: list[str]) -> str:
 
     scope = "1" if event["in_config"] else "0"
     tag_extra = "" if event["in_config"] else '<span class="tag">fora da config</span>'
+
+    params_html = ""
+    if event.get("params"):
+        params_html = f"""
+        <div class="params">
+          <h4>Parâmetros</h4>
+          {render_params(event["params"])}
+        </div>"""
 
     return f"""
       <div class="event" data-name="{esc(event["event_name"].lower())}"
@@ -750,6 +833,7 @@ def render_event(event: dict, dates: list[str]) -> str:
             <p>{esc(note)}</p>
           </div>
         </div>
+        {params_html}
       </div>"""
 
 
@@ -802,7 +886,9 @@ def render_html(view: dict) -> str:
     <h1>Estado do tracking</h1>
     <div class="stamp">Última verificação: {esc(view["checked_at"] or "desconhecida")}
       <small>Histórico até {esc(view["history_last_date"] or "—")}
-      ({view["history_days"]} dias) · página gerada em {esc(view["generated_at"])}</small>
+      ({view["history_days"]} dias)
+      {f' · Verificação de parâmetros: {esc(view["params_analyzed_at"])}' if view.get("params_analyzed_at") else ""}
+      · página gerada em {esc(view["generated_at"])}</small>
     </div>
     <div class="tally">{"".join(tally)}</div>
   </header>
@@ -824,6 +910,7 @@ def render_html(view: dict) -> str:
       <li><span class="swatch" style="background:#78909c;opacity:.45"></span><b>Cinzento claro</b> — evento de volume baixo: o monitor não emite veredito diário, logo a página também não.</li>
       <li><span class="swatch" style="background:#b0bec5"></span><b>Cinzento</b> — provisório. No Google Ads uma conversão pode demorar 24-72h a ser atribuída, por isso o dia mais recente nunca é dado como falhado (é o mesmo dia que o monitor ignora nas verificações).</li>
     </ul>
+    <p><b>Secção "Parâmetros"</b> (só em eventos GA4 — Google Ads não expõe parâmetros de conversão): mostra se o que a tag GTM está configurada a enviar chega mesmo preenchido à GA4, não só o que está configurado. "Não registado no GA4" é uma to-do list — falta criar uma custom dimension para o poder verificar. É atualizada semanalmente, por isso tem o seu próprio carimbo de data no topo, distinto do resto da página.</p>
     <p>Os critérios de cor são os mesmos que geram os alertas do Slack (importados de <code>src/baseline.py</code>),
        por isso esta página e o alerta nunca se contradizem.</p>
     <p><b>Isto não é ao vivo.</b> Mostra o que a Google Sheet tinha na última corrida do monitor — confirma sempre a data no topo.</p>
@@ -862,7 +949,8 @@ def main() -> None:
     if not data["config"]:
         print(f"Aviso: a aba '{CONFIG_TAB}' não devolveu linhas — a página fica sem severidades.")
 
-    view = build_view_model(data["config"], data["results"], data["dates"], data["series"])
+    view = build_view_model(data["config"], data["results"], data["dates"],
+                            data["series"], data["params_analysis"])
 
     # The filename carries the date on purpose: this file gets shared, and two
     # snapshots in the same Drive folder have to be tellable apart. The stamp

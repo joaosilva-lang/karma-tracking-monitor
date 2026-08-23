@@ -2,21 +2,28 @@ from datetime import datetime
 import gspread
 from google.oauth2.credentials import Credentials
 
+from src.gtm import NO_PARAMS, NO_TAG
+
+README_TAB = "_leia-me"
 CONFIG_TAB = "config"
 RESULTS_TAB = "results"
 HISTORY_TAB = "history_analysis"
 DAILY_TAB = "daily_history"
 PROPOSAL_TAB = "config_proposta"
+PARAMS_TAB = "params_analysis"
 
 # Optional columns: baseline_threshold_pct is the WARN threshold for the
 # relative check as a % of the weekday median (empty -> 50%);
 # gtm_container_id (GTM-XXXXXX, one non-empty value per client is enough),
 # Nome_Tag_GTM and GTM_Event_Params (both filled by the analyze_history GTM
 # step, never by hand) drive the informational event->GTM mapping.
+# params_check overrides which GA4 event parameters are listed in the weekly
+# params_analysis / dashboard (comma-separated names); empty means "use the
+# names GTM configures".
 CONFIG_HEADERS = [
     "client_id", "account_id", "platform", "event_name",
     "severity", "goback_days", "24hBackGA4_48hBackGAds", "baseline_threshold_pct",
-    "gtm_container_id", "Nome_Tag_GTM", "GTM_Event_Params",
+    "gtm_container_id", "Nome_Tag_GTM", "GTM_Event_Params", "params_check",
 ]
 GTM_TAG_COLUMN = "Nome_Tag_GTM"
 GTM_PARAMS_COLUMN = "GTM_Event_Params"
@@ -41,8 +48,8 @@ DEFAULT_GOBACK_DAYS = 7
 # wider goback window ("10d", etc). `check` is "count" (event/conversion
 # counting) or "value" (monetary value carried by the event — for value rows
 # the `count` column holds the value sum). `expected` is the weekday-median
-# baseline the count was compared against (empty for rows without a relative
-# check).
+# baseline the count was compared against for count rows (empty for rows
+# without a relative check).
 RESULTS_HEADERS = [
     "checked_at", "client_id", "platform", "event_name", "check",
     "severity", "window", "count", "expected", "status",
@@ -54,6 +61,16 @@ HISTORY_HEADERS = [
     "median_per_day", "weekday_medians",
     "pct_days_with_value", "value_carrying",
     "max_gap_days", "goback_days_sugerido", "suggestion_24h",
+]
+
+# One row per (client, platform, event, param) checked against GA4's
+# registered dimensions. `estado` is "verificado" (registered as a custom
+# dimension) / "built-in" (a GA4 native dimension) / "não registado no GA4 —
+# criar custom dimension" / "não verificável (Google Ads não expõe parâmetros
+# de conversão)". Existence only — no values, no percentages.
+PARAMS_HEADERS = [
+    "analyzed_at", "client_id", "platform", "event_name", "param", "tag_gtm",
+    "estado",
 ]
 
 
@@ -297,6 +314,82 @@ def write_config_proposal(sheet_id: str, client: gspread.Client, rows: list[dict
     for row in rows:
         table.append([row.get(header, "") for header in headers])
     _replace_tab_contents(sh, PROPOSAL_TAB, table, min_rows=200)
+
+
+def write_params_analysis(sheet_id: str, client: gspread.Client, rows: list[dict]) -> None:
+    """Rewrites the params_analysis tab: one row per (client, platform, event,
+    param) checked against GA4 (or reported non-verifiable for Google Ads).
+    Updated in place, like every other tab — see _replace_tab_contents.
+    """
+    sh = client.open_by_key(sheet_id)
+
+    analyzed_at = datetime.utcnow().strftime("%Y-%m-%d %H:%M UTC")
+    table = [PARAMS_HEADERS]
+    for row in rows:
+        table.append([
+            analyzed_at,
+            row["client_id"],
+            row["platform"],
+            row["event_name"],
+            row["param"],
+            row.get("tag_gtm", ""),
+            row["estado"],
+        ])
+    _replace_tab_contents(sh, PARAMS_TAB, table, min_rows=500)
+
+
+def write_readme_tab(sheet_id: str, client: gspread.Client) -> None:
+    """Generates a plain-text self-documentation tab from the header
+    constants, so it can never drift out of sync with the actual schema.
+    Run at the end of the weekly analysis; safe to run any time.
+    """
+    sh = client.open_by_key(sheet_id)
+
+    column_help = {
+        "client_id": "identificador do cliente (livre — o mesmo texto em todas as abas).",
+        "account_id": "GA4 property id ou Google Ads customer id, conforme a platform.",
+        "platform": "GA4 ou GADS.",
+        "event_name": "nome do evento GA4, ou o nome dado à conversão GAds.",
+        "severity": "critical (alerta no Slack + triagem) ou secondary (só aparece na results).",
+        "goback_days": "janela larga: FAIL se zero eventos nos últimos N dias. Vazio = 7.",
+        "24hBackGA4_48hBackGAds": "sim/não — ativa o zero-check diário para eventos abaixo do volume mínimo.",
+        "baseline_threshold_pct": "limiar do WARN da baseline automática, em % da mediana. Vazio = 50%.",
+        "gtm_container_id": "GTM-XXXXXX; uma linha não vazia por cliente já basta.",
+        "Nome_Tag_GTM": "preenchido pelo script — tag GTM que dispara o evento.",
+        "GTM_Event_Params": "preenchido pelo script — parâmetros que essa tag envia (configuração, não prova de entrega).",
+        "params_check": "override opcional dos parâmetros listados por evento na params_analysis (separados por vírgula). Vazio = automático a partir do GTM.",
+    }
+    config_lines = [f"  {col}: {column_help.get(col, '')}" for col in CONFIG_HEADERS]
+
+    lines = [
+        "TRACKING MONITOR — GUIA RÁPIDO (gerado automaticamente pelo script — não editar à mão)",
+        "",
+        "ABAS ESCRITAS PELO SCRIPT — substituídas por inteiro a cada corrida",
+        "(a folha em si sobrevive: fórmulas e formatação não se perdem, só o conteúdo é atualizado):",
+        f"  {RESULTS_TAB} — diária, pelo Daily Tracking Monitor.",
+        f"  {HISTORY_TAB} — semanal, pelo 90-Day History Analysis.",
+        f"  {DAILY_TAB} — diária e semanal (os dois jobs mantêm-na fresca).",
+        f"  {PARAMS_TAB} — semanal, pelo 90-Day History Analysis (registo de parâmetros na GA4).",
+        f"  {PROPOSAL_TAB} — só no Onboard New Client.",
+        "",
+        f"ABA '{CONFIG_TAB}' — a única editada à mão. Colunas:",
+        *config_lines,
+        "",
+        "LEITURA DE OK / WARN / FAIL: FAIL = zero eventos na janela. WARN = abaixo do",
+        "limiar face à mediana do dia-da-semana, ou 'silêncio recorde' (evento esporádico",
+        "calado há mais tempo do que alguma vez esteve nos últimos 90 dias).",
+        "",
+        f"MARCADORES: '{NO_TAG}' e '{NO_PARAMS}' — evento sem tag GTM ativa correspondente.",
+        f"'{NO_ACTIVE_TAG}' — linha de config a mais face às tags ativas (nunca apagada, só marcada).",
+        "",
+        f"ABA '{PARAMS_TAB}' — estado de cada parâmetro (nome apenas, sem valores): 'verificado'/",
+        "'built-in' (a GA4 confirma que está registado como dimension), 'não registado no GA4'",
+        "(é preciso criar uma custom dimension para o poder reportar — é a to-do list), 'não",
+        "verificável' (Google Ads não expõe parâmetros de conversão, informativo, nada a fazer).",
+    ]
+
+    table = [[line] for line in lines]
+    _replace_tab_contents(sh, README_TAB, table, min_rows=len(table) + 10, spare_cols=1)
 
 
 def write_daily_history(sheet_id: str, client: gspread.Client,

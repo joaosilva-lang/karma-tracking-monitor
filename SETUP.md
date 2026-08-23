@@ -84,6 +84,16 @@ The script prints 3 values: `GOOGLE_CLIENT_ID`, `GOOGLE_CLIENT_SECRET`, `GOOGLE_
 
    > Events not listed here are automatically treated as `secondary` (logged to Sheet only, no Slack alert).
 
+   > **Optional column `params_check`:** overrides which GA4 event parameter names get
+   > listed and checked against the live property's registered dimensions
+   > (comma-separated). Leave empty to use the parameters GTM is configured to send
+   > automatically — see ARCHITECTURE.md §5-quater. This needs the `gtm_container_id`
+   > column filled in (same one already used for the `Nome_Tag_GTM`/`GTM_Event_Params`
+   > mapping) and the refresh token to carry the `tagmanager.readonly` scope (Step 3) —
+   > only the weekly 90-Day History Analysis workflow needs it, not the daily job.
+   > Every event's parameters get a row in the weekly `params_analysis` tab (name +
+   > registration state, no values) — nothing else to set up.
+
 ---
 
 ## Step 5 — Create GitHub Repository & Add Secrets

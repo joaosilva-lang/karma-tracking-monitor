@@ -89,7 +89,7 @@ def main() -> None:
             maps = None
             print(f"⚠️ GTM indisponível ({exc}) — proposta segue sem colunas GTM.")
         if maps:
-            tag_map, param_map = maps
+            tag_map, param_map, _tags, _variables = maps
             gtm_ok = True
             print(f"✅ GTM OK — {len(tag_map)} eventos/conversões com tag na versão live.")
 

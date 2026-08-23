@@ -107,6 +107,19 @@ def get_24h_events(config_rows: list[dict], client_id: str, platform: str) -> se
     return flagged
 
 
+def get_params_check_override(config_rows: list[dict], client_id: str,
+                              platform: str, event_name: str) -> list[str] | None:
+    """Returns the params_check override for an event (comma-separated names,
+    parsed and stripped), or None to use the automatic GTM-derived list. An
+    empty/absent column means None — never "check nothing"."""
+    for row in config_rows:
+        if (row["client_id"] == client_id and row["platform"].upper() == platform.upper()
+                and row["event_name"] == event_name):
+            raw = str(row.get("params_check", "")).strip()
+            return [p.strip() for p in raw.split(",") if p.strip()] if raw else None
+    return None
+
+
 def _fetch_daily(account_id: str, platform: str, credentials: Credentials,
                  gads_client=None) -> tuple[dict, dict]:
     """Returns (counts, values) maps: {event: {date: n}} over BASELINE_DAYS."""
@@ -264,7 +277,7 @@ def run_checks(client_id: str, platforms: dict[str, str], credentials: Credentia
 
     if "GA4" in platforms:
         collect("GA4", _check_platform(
-            client_id, "GA4", "GA4", platforms["GA4"], credentials, config_rows
+            client_id, "GA4", "GA4", platforms["GA4"], credentials, config_rows,
         ))
 
     if "GADS" in platforms:

@@ -168,15 +168,12 @@ def _extract_event_params(entity: dict) -> list[tuple[str, str]]:
     return pairs
 
 
-def build_event_param_map(tags: list[dict], variables: list[dict]) -> dict[tuple[tuple[str, str], str], str]:
-    """Pure join: which parameters is each tag configured to send?
-
-    Returns {(("GA4", event_name) | ("GADS", conversion_label), tag_name):
-    "a={{X}}, b=EUR"} — keyed PER TAG (each config row carries exactly one
-    tag, so each row shows its own tag's params). Paused tags are excluded,
-    same as build_event_tag_map. GA4 tags referencing a shared Event Settings
-    variable get its params merged with the inline ones. Tags sending no
-    params map to NO_PARAMS.
+def _iter_tag_params(tags: list[dict], variables: list[dict]):
+    """Yields (key, tag_name, pairs) for each active tag that carries event
+    parameters — key is ("GA4", event_name) or ("GADS", conversion_label),
+    pairs is a list of (name, value_expr). Shared by build_event_param_map
+    (keeps the per-tag display string) and build_event_param_names (keeps only
+    the names, unioned per event) so the two never drift apart.
     """
     settings_vars = {
         v.get("name"): _extract_event_params(v)
@@ -184,7 +181,6 @@ def build_event_param_map(tags: list[dict], variables: list[dict]) -> dict[tuple
         if v.get("type") == TYPE_EVENT_SETTINGS_VAR
     }
 
-    params_by_tag: dict[tuple[tuple[str, str], str], str] = {}
     for tag in tags:
         if tag.get("paused"):
             continue
@@ -213,11 +209,45 @@ def build_event_param_map(tags: list[dict], variables: list[dict]) -> dict[tuple
         else:
             continue
 
-        params_by_tag[(key, tag.get("name", ""))] = (
+        yield key, tag.get("name", ""), pairs
+
+
+def build_event_param_map(tags: list[dict], variables: list[dict]) -> dict[tuple[tuple[str, str], str], str]:
+    """Pure join: which parameters is each tag configured to send?
+
+    Returns {(("GA4", event_name) | ("GADS", conversion_label), tag_name):
+    "a={{X}}, b=EUR"} — keyed PER TAG (each config row carries exactly one
+    tag, so each row shows its own tag's params). Paused tags are excluded,
+    same as build_event_tag_map. GA4 tags referencing a shared Event Settings
+    variable get its params merged with the inline ones. Tags sending no
+    params map to NO_PARAMS.
+    """
+    return {
+        (key, tag_name): (
             ", ".join(f"{name}={value}" for name, value in pairs) if pairs else NO_PARAMS
         )
+        for key, tag_name, pairs in _iter_tag_params(tags, variables)
+    }
 
-    return params_by_tag
+
+def build_event_param_names(tags: list[dict], variables: list[dict]) -> dict[tuple[str, str], list[str]]:
+    """Pure join: which parameter NAMES does an event carry, across all its
+    active tags?
+
+    Returns {("GA4", event_name) | ("GADS", conversion_label): [param_name,
+    ...]} — union of names across every active tag for that event, in
+    first-seen order. This is what the params-check queries against the GA4
+    Data API: it needs structured names, not build_event_param_map's display
+    string ("a={{X}}, b=EUR"), which is ambiguous once a value itself contains
+    a comma.
+    """
+    names: dict[tuple[str, str], list[str]] = {}
+    for key, _tag_name, pairs in _iter_tag_params(tags, variables):
+        bucket = names.setdefault(key, [])
+        for name, _value in pairs:
+            if name not in bucket:
+                bucket.append(name)
+    return names
 
 
 def extract_conversion_label(snippet: str) -> str | None:

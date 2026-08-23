@@ -309,12 +309,9 @@ Convenções (jul 2026 — **uma tag por linha**):
 
 **Falha graciosa:** o passo GTM está isolado em try/except — sem scope no token, sem
 acesso ao container, ou container inexistente → aviso no log e a análise completa na
-mesma. **Desde a verificação de parâmetros (§5-quater), o check diário (`main.py`)
-também usa o scope GTM** — para eventos `critical` em GA4, precisa de ler o container
-para saber que parâmetros verificar. Se o token não tiver `tagmanager.readonly`, o
-`main()` constrói o serviço GTM uma vez no arranque da corrida, falha com um aviso, e a
-verificação de parâmetros fica desativada nessa corrida inteira — os checks de
-contagem/valor nunca são afetados.
+mesma. **O check diário (`main.py`) não usa o scope GTM de todo** — nem para o
+mapeamento de tags nem para a verificação de parâmetros (§5-quater), que vive
+inteiramente no job semanal. Só `analyze_history.py` precisa do `tagmanager.readonly`.
 
 **Event parameters (`GTM_Event_Params`):** o mesmo passo extrai os parâmetros
 configurados em cada tag (nome + expressão, ex.: `value={{DLV - price}}, currency=EUR`),
@@ -345,58 +342,45 @@ incidente que motivou este projeto (conversões registadas, valor perdido no cam
 
 ---
 
-## 5-quater. Verificação de event parameters na GA4
+## 5-quater. Registo de event parameters na GA4
 
 A coluna `GTM_Event_Params` diz o que a tag GTM está **configurada** a enviar — prova
-zero sobre o que chega. Esta verificação confronta essa configuração com uma query real
-à GA4 Data API. **Só GA4**: o Google Ads não expõe parâmetros de conversão de forma
-alguma, por isso não há nada a verificar aí (o Google Ads aparece de qualquer forma na
-`params_analysis` semanal, marcado como não verificável — visibilidade honesta em vez de
-um silêncio que pareceria "nada configurado").
+zero sobre a plataforma. Esta verificação confronta essa configuração com a GA4 real,
+mas só quanto a **existência**, nunca valores: mostra o nome de cada parâmetro por
+evento, por plataforma, com um estado — nada de percentagens, nada de FAIL/WARN diário.
 
-**Constraint da API:** só são legíveis parâmetros que sejam uma dimension built-in
-(`transactionId`, `itemName`, `currencyId`, …) ou uma **custom dimension event-scoped**
-registada (`customEvent:<param>`). Um parâmetro não registado é invisível à API — a
-única forma de o descobrir é tentar a query e apanhar o erro (`fetch_daily_param_presence`
-em [src/ga4.py](src/ga4.py) tenta a dimension built-in primeiro quando aplicável, cai
-para `customEvent:` no erro, e devolve `None` se ambas falharem).
+**Como se verifica a existência:** a GA4 Data API tem um método de metadados
+(`fetch_registered_dimensions` em [src/ga4.py](src/ga4.py), via
+`client.get_metadata(properties/{id}/metadata)`) que devolve, **numa única chamada por
+property**, os `api_name` de todas as dimensions registadas — nativas e custom
+dimensions event-scoped (`customEvent:<param>`). Cruzando essa lista com os nomes que o
+GTM já dá por evento (`build_event_param_names` em [src/gtm.py](src/gtm.py)), cada
+parâmetro fica classificado: `built-in` (dimension nativa da GA4), `verificado` (custom
+dimension registada) ou "não registado no GA4 — criar custom dimension" (invisível à
+API — é a to-do list). Sem data range, sem uma query por parâmetro.
 
-**Critério binário, sem WARN:** FAIL só quando **nenhum** disparo do evento trouxe o
-parâmetro na janela — mesmo espírito do check de valor (zero falsos positivos por
-construção). A elegibilidade histórica reutiliza `is_value_carrying` tal e qual
-(≥80% dos dias em que o evento disparou, com o parâmetro presente, ≥10 dias de
-evidência) — evita alertar sobre parâmetros opcionais por natureza (ex.: `coupon`).
+**Cada evento de cada plataforma** — GA4 e Google Ads. O Google Ads não expõe
+parâmetros de conversão de forma alguma, por isso as suas linhas ficam com o estado
+informativo "não verificável (Google Ads não expõe parâmetros de conversão)" — os nomes
+continuam a aparecer (vêm do GTM), só não há nada para confirmar contra a plataforma.
 
-**Duas escalas de cobertura, por custo de API:**
-- **Diário** ([main.py](main.py), `fetch_critical_param_presence`): só eventos
-  `severity=critical` (é onde o Slack alerta) e só de GA4. Lista de parâmetros
-  automática a partir do GTM (`build_event_param_names` em
-  [src/gtm.py](src/gtm.py)), com a coluna opcional `params_check` na `config` como
-  override (nomes separados por vírgula; vazia = automático). Uma chamada
-  `fetch_daily_param_presence` por parâmetro distinto, não por evento.
-- **Semanal** ([analyze_history.py](analyze_history.py), `build_params_analysis_rows`):
-  cobertura total — todos os eventos, não só os critical — porque o custo aqui é
-  irrelevante. Escreve a aba `params_analysis`, uma linha por (cliente, plataforma,
-  evento, parâmetro), com `estado` (`verificado` / `built-in` / `não registado no GA4 —
-  criar custom dimension` / `não verificável` para GAds), a % de disparos com o
-  parâmetro nos últimos 90 dias, e `vigiado_no_diario` (reflete exatamente a mesma
-  resolução de nomes — override ou automático — que o check diário usa, para esta
-  coluna nunca afirmar uma cobertura que não existe).
+**Só semanal** ([analyze_history.py](analyze_history.py), `build_params_analysis_rows`,
+chamado a partir de `map_gtm_tags`): cobertura total, todos os eventos, não só os
+`critical` — o custo é uma chamada de metadados por cliente. O `main.py` (job diário)
+**não toca na GTM API de todo** para isto; a verificação vive inteiramente no job
+semanal, tal como já acontecia com o preenchimento de `Nome_Tag_GTM`/`GTM_Event_Params`.
+A coluna opcional `params_check` na `config` continua a permitir um override manual dos
+nomes a listar por evento (separados por vírgula; vazia = automático a partir do GTM).
 
-**Serviço GTM construído uma vez por corrida**, não por cliente: envolve um refresh
-OAuth e a leitura do discovery doc, que não devem repetir para cada cliente GA4 todos os
-dias. `main()` constrói o serviço no arranque; `None` (sem scope, erro de auth) desativa
-a verificação de parâmetros para a corrida inteira, sem repetir a mesma falha por
-cliente.
+Escreve a aba `params_analysis`, uma linha por (cliente, plataforma, evento, parâmetro),
+com `analyzed_at`, `tag_gtm` e `estado`. Uma falha a ler os metadados de um cliente
+(rate limit, scope em falta) salta só as linhas GA4 desse cliente, com aviso impresso —
+nunca falha o job inteiro, e as linhas GAds (que não dependem da GA4) não são afetadas.
 
-**Falha isolada por parâmetro:** um erro a verificar UM parâmetro (rate limit, timeout)
-descarta só esse parâmetro, nunca os restantes do mesmo cliente/dia — tanto no caminho
-diário como no semanal.
-
-**Dashboard ([dashboard.py](dashboard.py)):** secção "Parâmetros" por evento, só em
-GA4, com a `params_analysis` como 4ª aba **opcional** (a sua ausência não impede a
-página de gerar — só a secção não aparece). Tem o seu próprio carimbo de frescura
-distinto (é semanal, ao contrário do resto da página). Ver §7-bis.
+**Dashboard ([dashboard.py](dashboard.py)):** secção "Parâmetros" por evento, em GA4
+**e** Google Ads, com a `params_analysis` como 4ª aba **opcional** (a sua ausência não
+impede a página de gerar — só a secção não aparece). Tem o seu próprio carimbo de
+frescura distinto (é semanal, ao contrário do resto da página). Ver §7-bis.
 
 ---
 
@@ -504,11 +488,11 @@ alertas. As regras de elegibilidade são espelhadas uma a uma:
   dava falso alarme todos os dias.
 - Evento sem linha na `results` (acrescentado à config depois da última corrida,
   ou cuja recolha falhou) fica **por verificar**, nunca verde.
-- **Secção "Parâmetros"** (só GA4 — ver §5-quater): uma linha por parâmetro
-  verificado, com o estado semanal (`verificado`/`built-in`/`não registado`) e,
-  quando o evento é `critical` e vigiado diariamente, o veredito de hoje como
-  badge — nunca inventado, vem das linhas `check=param` da `results` do próprio
-  dia. "Não registado no GA4" é a única cor tratada como to-do (âmbar), não como
+- **Secção "Parâmetros"** (GA4 e Google Ads — ver §5-quater): uma linha por nome
+  de parâmetro, com o estado semanal (`verificado`/`built-in`/`não registado` em
+  GA4, `não verificável` em GAds) — só nomes, nunca valores nem percentagens.
+  Nenhum badge no cabeçalho do evento: isto não é um check com veredito diário.
+  "Não registado no GA4" é a única cor tratada como to-do (âmbar), não como
   incidente: falta criar a custom dimension, não há nada errado a acontecer agora.
 
 Uma nota sobre o gráfico dos 90 dias: o `weekday_median` por defeito procura

@@ -265,18 +265,6 @@ def badge_for(row: dict) -> dict:
     count = row.get("count", "")
     expected = row.get("expected", "")
 
-    if check == "param":
-        # count = fires that carried the parameter; expected = total fires of
-        # the event in the same window — "how many should have carried it".
-        param_name = str(row.get("param", "")).strip()
-        label = f"Parâmetro · {param_name}" if param_name else "Parâmetro"
-        has_total = expected not in ("", 0)
-        if status == "FAIL":
-            detail = f"ausente nos últimos {window}" + (f" ({expected} disparos)" if has_total else "")
-        else:
-            detail = f"{count}/{expected} disparos" if has_total else f"{count} disparos"
-        return {"label": label, "status": status, "detail": detail}
-
     if check == "value":
         label = f"Valor · {window}"
     elif window.endswith("d"):
@@ -299,12 +287,10 @@ def badge_for(row: dict) -> dict:
 
 
 def build_params_by_event(params_analysis: list[dict]) -> dict[tuple[str, str, str], list[dict]]:
-    """Groups params_analysis rows by (client_id, "GA4", event_name).
-
-    GAds rows exist in the tab for honesty on the Sheet (every param is
-    "não verificável" there) but are dropped here — see the "só GA4" decision
-    in the plan: repeating "não verificável" on every GAds event would be
-    noise with no action attached to it.
+    """Groups params_analysis rows by (client_id, platform, event_name) — for
+    every platform: GA4 rows carry a real registration check, GAds rows carry
+    an informative "não verificável" state (nothing to check there, but the
+    names are still worth showing).
 
     "não registado no GA4" sorts first within each event: it's the one state
     that's actually actionable (create a custom dimension), so it should be
@@ -312,14 +298,11 @@ def build_params_by_event(params_analysis: list[dict]) -> dict[tuple[str, str, s
     """
     grouped: dict[tuple[str, str, str], list[dict]] = {}
     for row in params_analysis:
-        if platform_key(row.get("platform", "")) != "GA4":
-            continue
-        key = (str(row.get("client_id", "")).strip(), "GA4",
+        key = (str(row.get("client_id", "")).strip(), platform_key(row.get("platform", "")),
                str(row.get("event_name", "")).strip())
         grouped.setdefault(key, []).append({
             "name": str(row.get("param", "")).strip(),
             "estado": str(row.get("estado", "")).strip(),
-            "pct": str(row.get("pct_disparos_com_param", "")).strip(),
             "tag_gtm": str(row.get("tag_gtm", "")).strip(),
         })
     for items in grouped.values():
@@ -452,23 +435,7 @@ def build_view_model(config_rows: list[dict], results: list[dict], dates: list[s
             for i, day in enumerate(week_dates)
         ]
 
-        # Today's verdict for each checked parameter, straight from the
-        # results rows already grouped for this event — no re-parsing of
-        # badge labels. Feeds event["params"]["daily_status"] below.
-        param_status_by_name: dict[str, str] = {}
-        for row in event_rows:
-            if str(row.get("check", "")).strip() != "param":
-                continue
-            name = str(row.get("param", "")).strip()
-            row_status = str(row.get("status", "")).strip()
-            if (name not in param_status_by_name
-                    or STATUS_RANK.get(row_status, 9) < STATUS_RANK.get(param_status_by_name[name], 9)):
-                param_status_by_name[name] = row_status
-
-        event_params = []
-        if platform == "GA4":
-            for p in params_by_event.get(key, []):
-                event_params.append({**p, "daily_status": param_status_by_name.get(p["name"])})
+        event_params = params_by_event.get(key, [])
 
         event = {
             "event_name": event_name,
@@ -798,20 +765,17 @@ def esc(value) -> str:
 
 
 def render_params(params: list[dict]) -> str:
-    """One row per verified parameter. `title=` carries the raw estado + GTM
-    tag as a native tooltip, same pattern as the SVG charts' hover text."""
+    """One row per parameter name, tagged with its GA4 registration state —
+    names only, never values. `title=` carries the raw estado + GTM tag as a
+    native tooltip, same pattern as the SVG charts' hover text."""
     rows = []
     for p in params:
         if "não registado" in p["estado"]:
             status, detail = "WARN", "não registado no GA4 — criar custom dimension"
-        elif p["daily_status"] == "FAIL":
-            status, detail = "FAIL", f"ausente hoje (histórico: {p['pct'] or '—'} dos disparos em 90d)"
-        elif p["daily_status"] in ("WARN", "OK"):
-            status, detail = p["daily_status"], f"presente em {p['pct'] or '—'} dos disparos (90d)"
+        elif "não verificável" in p["estado"]:
+            status, detail = "NA", p["estado"]
         else:
-            # Not watched daily: secondary event, or history doesn't yet
-            # prove the param is sent consistently enough to alert on.
-            status, detail = "NA", f"presente em {p['pct'] or '—'} dos disparos (90d) · não vigiado diariamente"
+            status, detail = "OK", p["estado"]
         rows.append(
             f'<div class="param-row" title="{esc(p["estado"])} · tag GTM: {esc(p["tag_gtm"] or "—")}">'
             f'<span class="param-name">{esc(p["name"])}</span>'
